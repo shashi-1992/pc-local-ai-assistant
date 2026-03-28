@@ -1,0 +1,246 @@
+# Recreate the Local AI Assistant (no Confluence data, no secrets)
+
+You **do not** need old `data/knowledge/`, `data/chroma/`, or `.env`. Those are recreated locally. This guide is **one file** you can save anywhere.
+
+---
+
+## Where the hell do `scripts/` come from?
+
+| What you copied | Do you have `scripts/setup.sh`? |
+|-----------------|--------------------------------|
+| Only **`REBUILD_BLUEPRINT.md`** | **No.** Blueprint is words only — no shell files. |
+| **`RECREATE_FROM_NOTHING.md`** + blueprint | **No** — unless you use **§4** below and create them by hand. |
+| **`REBUILD_SINGLE_FILE.md`** + you run **`extract_kit.py`** | **Yes.** Extract writes `scripts/setup.sh`, `scripts/ingest_docs.sh`, and everything else listed in that markdown. |
+
+So: **scripts are not missing — you never materialized them.** Either **extract from `REBUILD_SINGLE_FILE.md`**, or **paste §4 into `scripts/`** on disk.
+
+---
+
+## Pick one path
+
+| Path | What you carry | Effort |
+|------|----------------|--------|
+| **A — Best** | `docs/REBUILD_SINGLE_FILE.md` + the small Python script in **§2** below | Run one command → full tree |
+| **B — Prompt-only** | **Only this file** (use **§3** mega-prompt in Cursor / ChatGPT) | Longer; result may drift from exact code |
+| **C — Normal** | Personal git clone / zip of `local-ai-assistant/` | Trivial |
+
+---
+
+## Path A — Two files, zero internal data
+
+### What you need
+
+1. **`REBUILD_SINGLE_FILE.md`** from this repo (`docs/REBUILD_SINGLE_FILE.md`). It is large; it holds almost all source as markdown sections. **Do not copy from Markdown preview** — use the raw file.
+2. Save the script below as **`extract_kit.py`** next to that markdown (same folder is fine).
+
+### `extract_kit.py` (standalone — paste into a new file)
+
+```python
+#!/usr/bin/env python3
+"""Extract REBUILD_SINGLE_FILE.md → files. Usage:
+  python3 extract_kit.py --md REBUILD_SINGLE_FILE.md --dest ./local-ai-assistant
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+
+def extract(md_path: Path, dest_root: Path, dry_run: bool) -> None:
+    text = md_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    i, n, written = 0, len(lines), 0
+    while i < n:
+        m = re.match(r"^## File: `([^`]+)`\s*$", lines[i].rstrip("\n"))
+        if not m:
+            i += 1
+            continue
+        rel, i = m.group(1), i + 1
+        while i < n and lines[i].strip() == "":
+            i += 1
+        if i >= n or not lines[i].lstrip().startswith("```"):
+            print(f"skip (no fence): {rel}", file=sys.stderr)
+            continue
+        i += 1
+        buf: list[str] = []
+        while i < n:
+            line = lines[i]
+            if line.rstrip("\n").strip() == "```" and not buf:
+                i += 1
+                break
+            if line.rstrip("\n").strip() == "```":
+                i += 1
+                break
+            buf.append(line)
+            i += 1
+        out = dest_root / rel
+        content = "".join(buf)
+        if content and not content.endswith("\n"):
+            content += "\n"
+        if dry_run:
+            print(f"would write {out}")
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content, encoding="utf-8")
+            if rel.endswith(".sh"):
+                try:
+                    out.chmod(out.stat().st_mode | 0o111)
+                except OSError:
+                    pass
+            print(f"wrote {rel}")
+        written += 1
+    print(f"Done. {written} file(s).")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--md", type=Path, required=True)
+    ap.add_argument("--dest", type=Path, required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    if not a.md.is_file():
+        print(f"Not found: {a.md}", file=sys.stderr)
+        return 1
+    extract(a.md, a.dest, a.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### Commands
+
+```bash
+mkdir -p ~/restore && cd ~/restore
+# Put REBUILD_SINGLE_FILE.md and extract_kit.py here, then:
+python3 extract_kit.py --md REBUILD_SINGLE_FILE.md --dest ./local-ai-assistant --dry-run
+python3 extract_kit.py --md REBUILD_SINGLE_FILE.md --dest ./local-ai-assistant
+cd local-ai-assistant
+mkdir -p data/knowledge && touch data/knowledge/.gitkeep
+printf "# Sample\n\nHello world.\n" > data/knowledge/sample.md
+cp .env.example .env
+# Edit .env: OPENAI_API_KEY=...  OR  OPENAI_BASE_URL for Ollama
+chmod +x scripts/setup.sh scripts/ingest_docs.sh
+./scripts/setup.sh
+./scripts/ingest_docs.sh
+cd backend && source .venv/bin/activate && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000/ui/` or `POST /v1/chat`. **No corporate data** was required.
+
+---
+
+## §4 — Create `scripts/` by hand (no extract, no fat `.md`)
+
+From **project root** (folder that already has `backend/` after prompt-only rebuild or partial copy):
+
+```bash
+mkdir -p scripts
+```
+
+**`scripts/setup.sh`**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/backend"
+python3 -m venv .venv
+# shellcheck disable=SC1091
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install pytest httpx
+echo "Backend ready. From backend/: source .venv/bin/activate && uvicorn app.main:app --reload"
+```
+
+**`scripts/ingest_docs.sh`**
+
+```bash
+#!/usr/bin/env bash
+# PHASE_1 — ingest data/knowledge → Chroma (needs OPENAI_API_KEY in .env)
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/backend"
+# shellcheck disable=SC1091
+if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
+python -m app.cli_ingest
+```
+
+Then:
+
+```bash
+chmod +x scripts/setup.sh scripts/ingest_docs.sh
+```
+
+**Same thing without `.sh` files** (run yourself from project root):
+
+```bash
+cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && pip install pytest httpx
+# after .env is set and data/knowledge has files:
+cd backend && source .venv/bin/activate && python -m app.cli_ingest
+```
+
+---
+
+## Path B — Prompt-only (you have *only* this guide, no fat markdown)
+
+Paste **everything from the line below** into your coding agent as **one user message** (then iterate file-by-file if it stops early).
+
+```text
+You are implementing a local "Local AI Assistant" from scratch in Python.
+
+Stack: FastAPI, uvicorn, pydantic-settings (.env at project root, parent of backend/), OpenAI Python SDK for chat + embeddings, Chroma persistent client at data/chroma/, cosine space, collection name "knowledge".
+
+Layout:
+- backend/app/main.py — FastAPI app, include routers: health, chat, demo_integration, google_chat; mount StaticFiles from app/static at /ui
+- backend/app/config.py — all settings from env (OPENAI_API_KEY, OPENAI_BASE_URL optional, CHROMA_PERSIST_DIR, KNOWLEDGE_DIR, models, retrieve_top_k, adaptive_rag_enabled, rag_hyde_enabled, retrieve_max_distance, Jira/Bitbucket/Confluence/Google optional vars)
+- services/chroma_store.py — PersistentClient, get_or_create_collection metadata hnsw:space cosine
+- services/embeddings.py — OpenAI client factory; embed_texts, embed_query
+- services/ingestion.py — walk knowledge_dir for .md/.txt, chunk, embed_texts, upsert to Chroma with metadata source/path
+- services/query_router.py — adaptive: skip retrieval for trivial greetings
+- services/hyde.py — optional hypothetical document for retrieval query expansion
+- services/rag.py — answer_query_with_trace: if no client return config; if adaptive skip return direct; if collection empty index_empty; else retrieve with optional HyDE, distance filter, format context, chat.completions with system prompt "answer only from context"
+- services/chat_agent.py — OpenAI tools loop with registry + handlers
+- tools/registry.py — OPENAI_TOOLS list: search_internal_knowledge, jira, bitbucket, etc.
+- tools/handlers.py — implement or stub
+- routers/chat.py — POST /v1/chat body message, use_tools bool; call rag or chat_agent
+- routers/health.py, routers/google_chat.py, routers/demo_integration.py as needed
+- cli_ingest.py module to run ingestion
+- scripts/setup.sh (venv + pip install -r requirements.txt), scripts/ingest_docs.sh
+- backend/requirements.txt: fastapi, uvicorn, pydantic-settings, httpx, openai, chromadb, google libs as needed
+- .env.example with documented vars
+- static minimal chat HTML at /ui/
+
+Implement in order: config, chroma_store, embeddings, ingestion+cli, rag, chat router, main. Then add tools and Google routers. Add pytest tests for health and chat trace modes.
+
+Do not require any pre-existing data/knowledge except empty dir; document adding sample.md and running ingest.
+```
+
+After the model scaffolds, you still add **`data/knowledge/sample.md`**, **`.env`**, **`pip install`**, **`ingest`**, **`uvicorn`** yourself.
+
+---
+
+## What you never need to “carry”
+
+- **`data/knowledge/*`** — internal docs; start empty + one sample line.
+- **`data/chroma/`** — rebuilt by ingest.
+- **`.env`** — recreate from `.env.example` + your own keys on the new machine.
+
+---
+
+## If you still have the full repo
+
+You don’t need this guide — run **`python3 scripts/generate_rebuild_single_file.py`** to refresh `REBUILD_SINGLE_FILE.md`, or just zip the project (respect `.gitignore` for secrets).
+
+---
+
+## Doc map (optional)
+
+- **Architecture spec (no code):** `docs/REBUILD_BLUEPRINT.md`
+- **Fat code archive:** `docs/REBUILD_SINGLE_FILE.md`
+- **Repo hygiene / public copy:** `docs/PERSONAL_REPO_PLAYBOOK.md`
+
+**This file (`RECREATE_FROM_NOTHING.md`)** = the single “what do I do” guide when you can’t bring data and want the smallest carry set.
