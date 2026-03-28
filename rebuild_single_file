@@ -1,0 +1,3670 @@
+# Local AI Assistant — single-file rebuild kit
+
+_Generated 2026-03-29. Regenerate with: `python scripts/generate_rebuild_single_file.py`_
+
+## How to use this one file
+
+### Do **not** copy from Markdown preview
+
+Preview (Cursor / VS Code / GitHub rendered view) puts **HTML or styled text** on the clipboard, not the raw ` ``` ` fences. You lose indentation, backticks get stripped, and Sublime / GitHub’s **New file** UI get garbage. **Always copy from the plain-text editor tab** (the `.md` source), or skip manual copy entirely:
+
+**Recommended — extract all files at once:** save this file as `docs/REBUILD_SINGLE_FILE.md` in an empty project folder, add `scripts/extract_rebuild_kit.py` from the first script block in this doc (or copy it from a clone), then run:
+
+```bash
+python3 scripts/extract_rebuild_kit.py
+```
+
+From a full clone you already have: `python3 scripts/extract_rebuild_kit.py --dry-run` then run without `--dry-run` into a new empty directory via `--dest /path/to/new/local-ai-assistant`.
+
+### Manual copy (only from source view)
+
+1. Open **`REBUILD_SINGLE_FILE.md` as text** — not Preview. In VS Code / Cursor: use the editor pane; turn preview off or copy from there.
+2. Create an empty folder `local-ai-assistant/`.
+3. For each **File:** section, copy **only** the lines **between** the opening ` ``` ` and closing ` ``` ` (not the fence lines themselves).
+4. Create `data/knowledge/.gitkeep` (empty) and add your own `.md` / `.txt` under `data/knowledge/`.
+5. `cp .env.example .env` and set `OPENAI_API_KEY` or `OPENAI_BASE_URL`.
+6. Run `chmod +x scripts/setup.sh scripts/ingest_docs.sh` then `./scripts/setup.sh`, `./scripts/ingest_docs.sh`.
+7. `cd backend && source .venv/bin/activate && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`
+
+Optional: run `python scripts/generate_rebuild_single_file.py` from project root to refresh this file.
+
+Architecture summary: **FastAPI** → **RAG** (`services/rag.py`, Chroma, OpenAI embeddings/chat) + optional **tools** (`chat_agent`, `tools/*`) + **Google Chat** router. Design: RAG for bulk docs, tools for actions — see `docs/ARCHITECTURE_FROZEN.md` if you add docs separately.
+
+---
+
+## File: `.gitignore`
+
+```text
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+coverage/
+.claude/settings.local.json
+backend/.venv/
+data/chroma/
+
+# Ingested / private knowledge (Confluence exports, etc.) — safe for public repos
+data/knowledge/**
+!data/knowledge/.gitkeep
+
+# OAuth / downloaded credentials (if you save JSON next to the project)
+*credentials*.json
+*client_secret*.json
+token.json
+.gmail_token.json
+.google_chat_api_token.json
+
+__pycache__/
+*.pyc
+.pytest_cache/
+```
+
+## File: `.env.example`
+
+```text
+# Copy to project root: cp .env.example .env — never commit .env
+
+# LLM: OpenAI cloud OR local (Ollama-compatible). See docs/LOCAL_LLM.md
+OPENAI_API_KEY=
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# CHAT_MODEL=
+# EMBEDDING_MODEL=
+
+# Optional overrides (defaults: data/chroma, data/knowledge under project root)
+# CHROMA_PERSIST_DIR=
+# KNOWLEDGE_DIR=
+
+ANTHROPIC_API_KEY=
+
+# Phase 2 — Jira Cloud (optional)
+# JIRA_BASE_URL=https://your-domain.atlassian.net
+# JIRA_EMAIL=
+# JIRA_API_TOKEN=
+# JIRA_DEFAULT_PROJECT_KEY=
+
+# Phase 2 — Bitbucket Cloud (optional)
+# BITBUCKET_WORKSPACE=
+# BITBUCKET_USERNAME=
+# BITBUCKET_APP_PASSWORD=
+
+# Confluence ingest (optional)
+# CONFLUENCE_BASE_URL=https://your-domain.atlassian.net/wiki
+# CONFLUENCE_USER_EMAIL=
+# CONFLUENCE_API_TOKEN=
+
+# Jira / Bitbucket / Confluence HTTPS (httpx)
+# ATLASSIAN_HTTP_VERIFY=false     # insecure TLS + ignores proxy for these APIs (see atlassian_httpx.py)
+# ATLASSIAN_HTTPX_TRUST_ENV=true  # only when VERIFY=true: use HTTP(S)_PROXY from environment
+# ATLASSIAN_CA_BUNDLE=/path/to/corp.pem  # trust corporate CA (preferred over VERIFY=false)
+
+# RAG tuning (optional)
+# ADAPTIVE_RAG_ENABLED=true
+# RAG_HYDE_ENABLED=false
+# RETRIEVE_MAX_DISTANCE=     # e.g. 1.15 for cosine; leave empty to disable filter
+
+# Google: personal use — register app once in Google’s developer console (see docs/INTEGRATIONS.md)
+# Gmail (readonly — email only; see docs/GMAIL.md)
+# GMAIL_CLIENT_ID=
+# GMAIL_CLIENT_SECRET=
+# GMAIL_REFRESH_TOKEN=
+
+# --- Google Chat (only you + office Gmail — full checklist: docs/GOOGLE_CHAT.md) ---
+# Bot in Chat: Console Chat app → HTTP endpoint → https://<your-host>/v1/integrations/google-chat
+# GOOGLE_CHAT_ENABLED=true
+# Optional: proxy sends X-Chat-Secret if you set this
+# GOOGLE_CHAT_SHARED_SECRET=
+# Recommended for single space: only your space id (comma-separated if several)
+# GOOGLE_CHAT_ALLOWED_SPACES=spaces/AAAAAAAAAAA
+# GOOGLE_CHAT_USE_TOOLS=true
+# Chat API (optional — list/read spaces): OAuth Desktop client in Console, then: python -m app.cli_google_chat_api oauth
+# GOOGLE_CHAT_API_CLIENT_ID=
+# GOOGLE_CHAT_API_CLIENT_SECRET=
+# GOOGLE_CHAT_API_REFRESH_TOKEN=
+# GOOGLE_CHAT_API_DEFAULT_SPACE=spaces/AAAAAAAAAAA
+# Slack-style post (no OAuth): incoming webhook URL from Chat space → Manage webhooks
+# GOOGLE_CHAT_INCOMING_WEBHOOK_URL=https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...
+
+# App
+APP_ENV=development
+LOG_LEVEL=INFO
+
+# Phase 1+ retrieval — example Postgres + pgvector
+DATABASE_URL=postgresql://user:pass@localhost:5432/assistant
+
+# Redis (optional, sessions / cache — Phase 3+)
+REDIS_URL=redis://localhost:6379/0
+
+# Vector DB — if using Qdrant/Pinecone instead of PGVector
+# QDRANT_URL=
+# PINECONE_API_KEY=
+```
+
+## File: `Dockerfile`
+
+```text
+# Build from repo root: docker build -t local-ai-assistant .
+# Runtime layout matches backend/app/config.py: _PROJECT_ROOT = parents[2] => /app
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app/backend
+
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ ./
+
+# Project root data dirs (Chroma + knowledge); chroma is empty until ingest
+COPY data/ /app/data/
+RUN mkdir -p /app/data/chroma /app/data/knowledge && touch /app/.env
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## File: `backend/requirements.txt`
+
+```text
+# PHASE_1 — tighten versions in production
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic-settings>=2.0.0
+httpx>=0.26.0
+openai>=1.40.0
+chromadb>=0.5.0
+# Gmail API (connector + gmail_search tool)
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.2.0
+# Phase 2+
+# psycopg2-binary
+# redis
+```
+
+## File: `scripts/generate_rebuild_single_file.py`
+
+```text
+#!/usr/bin/env python3
+"""Emit docs/REBUILD_SINGLE_FILE.md — one markdown with copy-paste contents for full rebuild."""
+from __future__ import annotations
+
+import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "docs" / "REBUILD_SINGLE_FILE.md"
+
+# Order: config & scripts first, then app tree (imports roughly satisfied when reading top-down)
+PATHS: list[str] = [
+    ".gitignore",
+    ".env.example",
+    "Dockerfile",
+    "backend/requirements.txt",
+    "scripts/generate_rebuild_single_file.py",
+    "scripts/extract_rebuild_kit.py",
+    "scripts/setup.sh",
+    "scripts/ingest_docs.sh",
+    "backend/app/__init__.py",
+    "backend/app/main.py",
+    "backend/app/config.py",
+    "backend/app/atlassian_httpx.py",
+    "backend/app/cli_ingest.py",
+    "backend/app/cli_confluence.py",
+    "backend/app/cli_gmail.py",
+    "backend/app/cli_google_chat_api.py",
+    "backend/app/routers/health.py",
+    "backend/app/routers/chat.py",
+    "backend/app/routers/demo_integration.py",
+    "backend/app/routers/google_chat.py",
+    "backend/app/services/chroma_store.py",
+    "backend/app/services/embeddings.py",
+    "backend/app/services/ingestion.py",
+    "backend/app/services/query_router.py",
+    "backend/app/services/hyde.py",
+    "backend/app/services/rag.py",
+    "backend/app/services/chat_agent.py",
+    "backend/app/services/google_chat_handler.py",
+    "backend/app/tools/__init__.py",
+    "backend/app/tools/registry.py",
+    "backend/app/tools/handlers.py",
+    "backend/app/connectors/__init__.py",
+    "backend/app/connectors/confluence.py",
+    "backend/app/connectors/google_chat_api.py",
+    "backend/app/connectors/google_chat_incoming_webhook.py",
+    "backend/app/connectors/gmail.py",
+    "backend/app/static/index.html",
+    "backend/app/static/integrations.html",
+    "backend/tests/__init__.py",
+    "backend/tests/test_adaptive.py",
+    "backend/tests/test_chat_trace.py",
+    "backend/tests/test_demo_status.py",
+    "backend/tests/test_gmail_tool.py",
+    "backend/tests/test_google_chat_api_tool.py",
+    "backend/tests/test_google_chat_handler.py",
+    "backend/tests/test_health.py",
+    "backend/tests/test_tools.py",
+]
+
+
+def fence_lang(path: str) -> str:
+    if path.endswith(".sh"):
+        return "bash"
+    if path.endswith((".html", ".md")):
+        return "html" if path.endswith(".html") else "markdown"
+    return "text"
+
+
+def main() -> None:
+    lines: list[str] = [
+        "# Local AI Assistant — single-file rebuild kit",
+        "",
+        f"_Generated {datetime.date.today().isoformat()}. Regenerate with: `python scripts/generate_rebuild_single_file.py`_",
+        "",
+        "## How to use this one file",
+        "",
+        "### Do **not** copy from Markdown preview",
+        "",
+        "Preview (Cursor / VS Code / GitHub rendered view) puts **HTML or styled text** on the clipboard, not the raw ` ``` ` fences. You lose indentation, backticks get stripped, and Sublime / GitHub’s **New file** UI get garbage. **Always copy from the plain-text editor tab** (the `.md` source), or skip manual copy entirely:",
+        "",
+        "**Recommended — extract all files at once:** save this file as `docs/REBUILD_SINGLE_FILE.md` in an empty project folder, add `scripts/extract_rebuild_kit.py` from the first script block in this doc (or copy it from a clone), then run:",
+        "",
+        "```bash",
+        "python3 scripts/extract_rebuild_kit.py",
+        "```",
+        "",
+        "From a full clone you already have: `python3 scripts/extract_rebuild_kit.py --dry-run` then run without `--dry-run` into a new empty directory via `--dest /path/to/new/local-ai-assistant`.",
+        "",
+        "### Manual copy (only from source view)",
+        "",
+        "1. Open **`REBUILD_SINGLE_FILE.md` as text** — not Preview. In VS Code / Cursor: use the editor pane; turn preview off or copy from there.",
+        "2. Create an empty folder `local-ai-assistant/`.",
+        "3. For each **File:** section, copy **only** the lines **between** the opening ` ``` ` and closing ` ``` ` (not the fence lines themselves).",
+        "4. Create `data/knowledge/.gitkeep` (empty) and add your own `.md` / `.txt` under `data/knowledge/`.",
+        "5. `cp .env.example .env` and set `OPENAI_API_KEY` or `OPENAI_BASE_URL`.",
+        "6. Run `chmod +x scripts/setup.sh scripts/ingest_docs.sh` then `./scripts/setup.sh`, `./scripts/ingest_docs.sh`.",
+        "7. `cd backend && source .venv/bin/activate && uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`",
+        "",
+        "Optional: run `python scripts/generate_rebuild_single_file.py` from project root to refresh this file.",
+        "",
+        "Architecture summary: **FastAPI** → **RAG** (`services/rag.py`, Chroma, OpenAI embeddings/chat) + optional **tools** (`chat_agent`, `tools/*`) + **Google Chat** router. Design: RAG for bulk docs, tools for actions — see `docs/ARCHITECTURE_FROZEN.md` if you add docs separately.",
+        "",
+        "---",
+        "",
+    ]
+
+    for rel in PATHS:
+        fp = ROOT / rel
+        if not fp.is_file():
+            raise SystemExit(f"Missing: {fp}")
+        body = fp.read_text(encoding="utf-8")
+        lang = fence_lang(rel)
+        lines.append(f"## File: `{rel}`")
+        lines.append("")
+        lines.append(f"```{lang}")
+        lines.append(body.rstrip("\n"))
+        lines.append("```")
+        lines.append("")
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Wrote {OUT} ({len(PATHS)} files embedded)")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## File: `scripts/extract_rebuild_kit.py`
+
+```text
+#!/usr/bin/env python3
+"""
+Extract files from docs/REBUILD_SINGLE_FILE.md into the current directory tree.
+
+Use this instead of copy-pasting from Markdown preview (preview often breaks fences
+and line endings). Run from project root:
+
+  python3 scripts/extract_rebuild_kit.py
+  python3 scripts/extract_rebuild_kit.py --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MD = ROOT / "docs" / "REBUILD_SINGLE_FILE.md"
+
+
+def extract(md_path: Path, dest_root: Path, dry_run: bool) -> int:
+    text = md_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+
+    i = 0
+    written = 0
+    n = len(lines)
+
+    while i < n:
+        m = re.match(r"^## File: `([^`]+)`\s*$", lines[i].rstrip("\n"))
+        if not m:
+            i += 1
+            continue
+        rel = m.group(1)
+        i += 1
+        # skip blank lines
+        while i < n and lines[i].strip() == "":
+            i += 1
+        if i >= n or not lines[i].lstrip().startswith("```"):
+            print(f"Warning: no opening fence after ## File: `{rel}`", file=sys.stderr)
+            continue
+        i += 1  # skip opening fence
+        buf: list[str] = []
+        while i < n:
+            line = lines[i]
+            if line.rstrip("\n").strip() == "```" and not buf:
+                # empty file
+                i += 1
+                break
+            if line.rstrip("\n").strip() == "```":
+                i += 1
+                break
+            buf.append(line)
+            i += 1
+
+        out = dest_root / rel
+        content = "".join(buf)
+        # normalize trailing newline
+        if content and not content.endswith("\n"):
+            content += "\n"
+
+        if dry_run:
+            print(f"would write {out} ({len(content)} bytes)")
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content, encoding="utf-8")
+            if rel.endswith(".sh"):
+                try:
+                    out.chmod(out.stat().st_mode | 0o111)
+                except OSError:
+                    pass
+            print(f"wrote {rel}")
+        written += 1
+
+    print(f"Done. {written} file(s).")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract REBUILD_SINGLE_FILE.md to disk.")
+    ap.add_argument(
+        "--md",
+        type=Path,
+        default=DEFAULT_MD,
+        help="Path to REBUILD_SINGLE_FILE.md",
+    )
+    ap.add_argument(
+        "--dest",
+        type=Path,
+        default=ROOT,
+        help="Root directory to write paths under (default: repo root)",
+    )
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    if not args.md.is_file():
+        print(f"Not found: {args.md}", file=sys.stderr)
+        return 1
+
+    return extract(args.md, args.dest, args.dry_run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## File: `scripts/setup.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/backend"
+python3 -m venv .venv
+# shellcheck disable=SC1091
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install pytest httpx
+echo "Backend ready. From backend/: source .venv/bin/activate && uvicorn app.main:app --reload"
+```
+
+## File: `scripts/ingest_docs.sh`
+
+```bash
+#!/usr/bin/env bash
+# PHASE_1 — ingest data/knowledge → Chroma (needs OPENAI_API_KEY in .env)
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/backend"
+# shellcheck disable=SC1091
+if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
+python -m app.cli_ingest
+```
+
+## File: `backend/app/__init__.py`
+
+```text
+# PHASE_1 MVP — FastAPI chat + RAG (stubs)
+```
+
+## File: `backend/app/main.py`
+
+```text
+"""PHASE_1: Chat API — query → Chroma retrieve → OpenAI chat."""
+
+import logging
+import os
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from app.routers import chat, demo_integration, google_chat, health
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(levelname)s %(name)s %(message)s",
+)
+
+app = FastAPI(title="Local AI Assistant", version="0.1.0")
+app.include_router(health.router)
+app.include_router(demo_integration.router)
+app.include_router(chat.router)
+app.include_router(google_chat.router)
+
+_STATIC = Path(__file__).resolve().parent / "static"
+if _STATIC.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(_STATIC), html=True), name="ui")
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "local-ai-assistant",
+        "docs": "/docs",
+        "chat_ui": "/ui/",
+        "integrations_demo": "/ui/integrations.html",
+        "demo_status": "/v1/demo/integration-status",
+        "demo_jira_issue": "POST /v1/demo/jira-issue",
+        "roadmap": "see docs/ROADMAP.md",
+    }
+```
+
+## File: `backend/app/config.py`
+
+```text
+"""App settings — loads from environment / .env at project root."""
+
+from pathlib import Path
+from typing import Any
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# local-ai-assistant/ (parent of backend/)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(_PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    app_env: str = "development"
+    log_level: str = "INFO"
+
+    openai_api_key: str = ""
+    # OpenAI-compatible API base (e.g. Ollama: http://localhost:11434/v1). If set, api_key may be omitted (uses placeholder).
+    openai_base_url: str = ""
+
+    # Paths (defaults under project root)
+    chroma_persist_dir: Path = _PROJECT_ROOT / "data" / "chroma"
+    knowledge_dir: Path = _PROJECT_ROOT / "data" / "knowledge"
+
+    chroma_collection: str = "knowledge"
+    embedding_model: str = "text-embedding-3-small"
+    chat_model: str = "gpt-4o-mini"
+    retrieve_top_k: int = 5
+    # Adaptive RAG: skip vector DB for trivial/greeting messages (see query_router.py)
+    adaptive_rag_enabled: bool = True
+    # HyDE: embed a hypothetical doc for retrieval (extra LLM call per request when True)
+    rag_hyde_enabled: bool = False
+    # Cosine distance max per chunk; None = no filter. Typical try 1.0–1.3 (lower = stricter)
+    retrieve_max_distance: float | None = None
+
+    agent_max_tool_rounds: int = 5
+
+    # Phase 2 — Jira Cloud (optional; stub if unset)
+    jira_base_url: str = ""  # e.g. https://your-domain.atlassian.net
+    jira_email: str = ""
+    jira_api_token: str = ""
+    jira_default_project_key: str = ""
+
+    # Bitbucket Cloud (optional)
+    bitbucket_workspace: str = ""
+    bitbucket_username: str = ""
+    bitbucket_app_password: str = ""
+
+    # Confluence Cloud (optional — for ingest connector)
+    confluence_base_url: str = ""  # e.g. https://your-domain.atlassian.net/wiki
+    confluence_user_email: str = ""
+    confluence_api_token: str = ""
+
+    # TLS for Jira / Bitbucket / Confluence REST calls (httpx). Default verify certs.
+    # ATLASSIAN_HTTP_VERIFY=false — skip cert verify (insecure). Quotes in .env are stripped.
+    atlassian_http_verify: bool = True
+    # If set, path to PEM bundle for verify= (overrides the bool above). Fixes corporate CA without verify=false.
+    atlassian_ca_bundle: str = ""
+    # httpx trust_env: use HTTP(S)_PROXY from environment. Set false if proxy breaks Atlassian TLS.
+    atlassian_http_trust_env: bool = True
+
+    @field_validator("atlassian_http_verify", "atlassian_http_trust_env", mode="before")
+    @classmethod
+    def _coerce_atlassian_bool(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().strip('"').strip("'").lower()
+        if s in ("false", "0", "no", "off"):
+            return False
+        if s in ("true", "1", "yes", "on"):
+            return True
+        return v
+
+    # Google Chat (spaces at chat.google.com) — HTTP Chat app endpoint
+    google_chat_enabled: bool = False
+    # If set, require header X-Chat-Secret on webhook (recommended behind HTTPS / reverse proxy)
+    google_chat_shared_secret: str = ""
+    # Comma-separated space names e.g. spaces/AAAAA; empty = allow all
+    google_chat_allowed_spaces: str = ""
+    # Use tool-calling agent (Jira/Bitbucket) when user prefixes message with !tools
+    google_chat_use_tools: bool = True
+
+    # Google Chat API — user OAuth for Workspace Chat (spaces/messages); not Gmail mail
+    google_chat_api_client_id: str = ""
+    google_chat_api_client_secret: str = ""
+    google_chat_api_refresh_token: str = ""
+    # Optional default for agent tool google_chat_recent_messages, e.g. spaces/AAAA...
+    google_chat_api_default_space: str = ""
+    # Incoming webhook URL from Chat space (Manage webhooks) — Slack-style curl; no OAuth / Cloud client needed to post
+    google_chat_incoming_webhook_url: str = ""
+
+    # Gmail (personal mailbox — OAuth2 refresh token; see docs/GMAIL.md)
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+    gmail_refresh_token: str = ""
+
+
+settings = Settings()
+```
+
+## File: `backend/app/atlassian_httpx.py`
+
+```text
+"""Shared httpx settings for Jira / Bitbucket / Confluence (TLS + proxy behavior)."""
+
+from __future__ import annotations
+
+import logging
+import ssl
+from typing import Any
+
+import httpx
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _insecure_ssl_context() -> ssl.SSLContext:
+    """Explicit no-verify context (more reliable across httpx/OpenSSL than verify=False alone)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def atlassian_httpx_client_kwargs(timeout: float = 30.0) -> dict[str, Any]:
+    """
+    - ATLASSIAN_CA_BUNDLE set → verify=path to PEM.
+    - Else ATLASSIAN_HTTP_VERIFY=false → insecure SSLContext + trust_env=False (ignores HTTP_PROXY;
+      corporate proxies often break TLS even when verify is off).
+    - Else → verify=True, trust_env from ATLASSIAN_HTTPX_TRUST_ENV.
+    """
+    bundle = (settings.atlassian_ca_bundle or "").strip()
+    if bundle:
+        verify: bool | ssl.SSLContext | str = bundle
+        trust_env = settings.atlassian_http_trust_env
+    elif not settings.atlassian_http_verify:
+        verify = _insecure_ssl_context()
+        # Must ignore HTTP(S)_PROXY for many corporate setups; otherwise MITM proxy still fails.
+        trust_env = False
+        logger.warning(
+            "Atlassian TLS: using insecure SSL context + trust_env=False "
+            "(ATLASSIAN_HTTP_VERIFY=false). Not for production."
+        )
+    else:
+        verify = True
+        trust_env = settings.atlassian_http_trust_env
+
+    return {"timeout": timeout, "verify": verify, "trust_env": trust_env}
+
+
+def atlassian_httpx_Client(timeout: float = 30.0) -> httpx.Client:
+    return httpx.Client(**atlassian_httpx_client_kwargs(timeout=timeout))
+
+
+def atlassian_httpx_insecure_plain_client(timeout: float = 30.0) -> httpx.Client:
+    """Last-resort client: verify=False + trust_env=False (no SSLContext object)."""
+    return httpx.Client(timeout=timeout, verify=False, trust_env=False)
+
+
+def jira_post_json_ssl_unverified(url: str, payload: dict, auth: tuple[str, str]) -> tuple[int, bytes]:
+    """
+    Final fallback for stubborn TLS: stdlib urllib + ssl._create_unverified_context().
+    Returns (status_code, response_body).
+    """
+    import base64
+    import json as json_lib
+    import urllib.error
+    import urllib.request
+
+    data = json_lib.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    ctx = ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+```
+
+## File: `backend/app/cli_ingest.py`
+
+```text
+"""CLI: ingest data/knowledge into Chroma. Run from backend/: python -m app.cli_ingest"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+
+from app.config import settings
+from app.services.ingestion import ingest_directory
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def main() -> int:
+    if not settings.openai_api_key:
+        logger.error("OPENAI_API_KEY missing — add it to %s/.env", Path(__file__).resolve().parents[2])
+        return 1
+    stats = ingest_directory()
+    if not stats:
+        logger.warning("No files ingested. Put .md/.txt under %s", settings.knowledge_dir)
+        return 1
+    total = sum(stats.values())
+    logger.info("Done. Files=%s chunks=%s", len(stats), total)
+    for k, v in sorted(stats.items()):
+        logger.info("  %s -> %s chunks", k, v)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## File: `backend/app/cli_confluence.py`
+
+```text
+"""Pull Confluence space into data/knowledge/confluence/ then optionally re-ingest."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from app.config import settings
+from app.connectors.confluence import fetch_space_to_markdown
+from app.services.ingestion import ingest_directory
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Fetch Confluence space to markdown")
+    p.add_argument("--space", required=True, help="Confluence space key")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output directory (default: data/knowledge/confluence/<space>)",
+    )
+    p.add_argument(
+        "--ingest",
+        action="store_true",
+        help="Run Chroma ingestion after download",
+    )
+    args = p.parse_args()
+
+    out = args.out or (settings.knowledge_dir / "confluence" / args.space)
+    try:
+        paths = fetch_space_to_markdown(args.space, out)
+    except Exception as e:
+        logger.error("%s", e)
+        return 1
+    logger.info("Wrote %s pages to %s", len(paths), out)
+    if args.ingest:
+        stats = ingest_directory(settings.knowledge_dir)
+        logger.info("Ingest stats: %s chunks total", sum(stats.values()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## File: `backend/app/cli_gmail.py`
+
+```text
+"""OAuth setup + pull Gmail search results into data/knowledge/gmail/ for RAG."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+from app.config import settings
+from app.connectors.gmail import SCOPES, fetch_query_to_markdown, gmail_oauth_configured
+from app.services.ingestion import ingest_directory
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def _client_config() -> dict:
+    cid = (settings.gmail_client_id or "").strip()
+    csec = (settings.gmail_client_secret or "").strip()
+    if not cid or not csec:
+        raise SystemExit(
+            "Set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env (OAuth client from Google Cloud Console)."
+        )
+    return {
+        "installed": {
+            "client_id": cid,
+            "client_secret": csec,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+
+
+def cmd_oauth() -> int:
+    """Open browser; print refresh token to paste into .env as GMAIL_REFRESH_TOKEN."""
+    flow = InstalledAppFlow.from_client_config(_client_config(), SCOPES)
+    creds = flow.run_local_server(
+        port=0,
+        open_browser=True,
+        access_type="offline",
+        prompt="consent",
+    )
+    rt = getattr(creds, "refresh_token", None)
+    if not rt:
+        logger.error("No refresh token returned. Revoke app access and retry, or use 'prompt=consent'.")
+        return 1
+    print("\n--- Add to .env ---\n")
+    print(f"GMAIL_REFRESH_TOKEN={rt}\n")
+    print("Keep GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET as already set.\n")
+    return 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    if not gmail_oauth_configured():
+        logger.error("Configure GMAIL_* in .env first; run: python -m app.cli_gmail oauth")
+        return 1
+    out = args.out or (settings.knowledge_dir / "gmail" / _safe_dir(args.query))
+    try:
+        paths = fetch_query_to_markdown(args.query, out, max_messages=args.max)
+    except Exception as e:
+        logger.error("%s", e)
+        return 1
+    logger.info("Wrote %s messages to %s", len(paths), out)
+    if args.ingest:
+        stats = ingest_directory(settings.knowledge_dir)
+        logger.info("Ingest stats: %s chunks total", sum(stats.values()))
+    return 0
+
+
+def _safe_dir(q: str) -> str:
+    s = "".join(c if c.isalnum() or c in "-_" else "_" for c in q[:60])
+    return s.strip("_") or "export"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Gmail OAuth and export for RAG")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("oauth", help="Browser OAuth — prints GMAIL_REFRESH_TOKEN")
+
+    pull = sub.add_parser("pull", help="Search Gmail and write markdown files")
+    pull.add_argument("--query", "-q", required=True, help="Gmail search query (same as UI)")
+    pull.add_argument("--max", type=int, default=50, help="Max messages (default 50)")
+    pull.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output dir (default: data/knowledge/gmail/<sanitized query>)",
+    )
+    pull.add_argument("--ingest", action="store_true", help="Re-ingest entire knowledge_dir")
+
+    args = p.parse_args()
+    if args.cmd == "oauth":
+        return cmd_oauth()
+    if args.cmd == "pull":
+        return cmd_pull(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## File: `backend/app/cli_google_chat_api.py`
+
+```text
+"""OAuth + export Google Chat messages (Workspace) for RAG — not Gmail mail."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+from app.config import settings
+from app.connectors.google_chat_api import (
+    CHAT_API_SCOPES,
+    fetch_space_messages_to_markdown,
+    google_chat_api_configured,
+)
+from app.services.ingestion import ingest_directory
+from app.tools.handlers import execute_tool
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def _client_config() -> dict:
+    cid = (settings.google_chat_api_client_id or "").strip()
+    csec = (settings.google_chat_api_client_secret or "").strip()
+    if not cid or not csec:
+        raise SystemExit(
+            "Set GOOGLE_CHAT_API_CLIENT_ID and GOOGLE_CHAT_API_CLIENT_SECRET in .env "
+            "(OAuth client — same project as Chat API enabled)."
+        )
+    return {
+        "installed": {
+            "client_id": cid,
+            "client_secret": csec,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+
+
+def cmd_oauth() -> int:
+    flow = InstalledAppFlow.from_client_config(_client_config(), CHAT_API_SCOPES)
+    creds = flow.run_local_server(
+        port=0,
+        open_browser=True,
+        access_type="offline",
+        prompt="consent",
+    )
+    rt = getattr(creds, "refresh_token", None)
+    if not rt:
+        logger.error("No refresh token. Revoke app access and retry.")
+        return 1
+    print("\n--- Add to .env ---\n")
+    print(f"GOOGLE_CHAT_API_REFRESH_TOKEN={rt}\n")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    hook = (settings.google_chat_incoming_webhook_url or "").strip()
+    if not hook:
+        if not google_chat_api_configured():
+            logger.error(
+                "Set GOOGLE_CHAT_INCOMING_WEBHOOK_URL (incoming webhook, Slack-style) or "
+                "GOOGLE_CHAT_API_* + oauth — see docs/GOOGLE_CHAT.md"
+            )
+            return 1
+        if not (args.space or "").strip() and not (settings.google_chat_api_default_space or "").strip():
+            logger.error("OAuth path needs --space or GOOGLE_CHAT_API_DEFAULT_SPACE in .env")
+            return 1
+    out = execute_tool(
+        "google_chat_send_message",
+        {"space": (args.space or "").strip(), "message": args.message},
+    )
+    print(out)
+    bad = (
+        "[Stub]" in out
+        or "Missing" in out
+        or "not configured" in out.lower()
+        or out.startswith("Webhook HTTP")
+        or out.startswith("Google Chat webhook error")
+        or out.startswith("Google Chat API error")
+    )
+    return 1 if bad else 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    if not google_chat_api_configured():
+        logger.error("Configure GOOGLE_CHAT_API_* in .env; run: python -m app.cli_google_chat_api oauth")
+        return 1
+    out = args.out or (
+        settings.knowledge_dir / "google_chat" / _safe_segment(args.space) / "messages.md"
+    )
+    try:
+        n = fetch_space_messages_to_markdown(args.space, out, max_messages=args.max)
+    except Exception as e:
+        logger.error("%s", e)
+        return 1
+    logger.info("Exported %s messages → %s", n, out)
+    if args.ingest:
+        stats = ingest_directory(settings.knowledge_dir)
+        logger.info("Ingest stats: %s chunks total", sum(stats.values()))
+    return 0
+
+
+def _safe_segment(space: str) -> str:
+    s = space.replace("spaces/", "").replace("/", "_")[:80] or "space"
+    return s
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Google Chat API (Workspace) OAuth and export")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("oauth", help="Browser OAuth — prints GOOGLE_CHAT_API_REFRESH_TOKEN")
+
+    send = sub.add_parser("send", help="Post text — incoming webhook URL in .env and/or OAuth")
+    send.add_argument(
+        "--space",
+        "-s",
+        default="",
+        help="OAuth only: spaces/AAAA… (omit if GOOGLE_CHAT_INCOMING_WEBHOOK_URL or default space set)",
+    )
+    send.add_argument("--message", "-m", required=True, help="Plain text to post")
+
+    pull = sub.add_parser("pull", help="Export messages from a space to markdown")
+    pull.add_argument(
+        "--space",
+        "-s",
+        required=True,
+        help='Space resource name, e.g. spaces/AAAAxxxxxxx or AAAAxxxxxxx',
+    )
+    pull.add_argument("--max", type=int, default=100, help="Max messages (default 100)")
+    pull.add_argument("--out", type=Path, default=None, help="Output .md path")
+    pull.add_argument("--ingest", action="store_true", help="Re-ingest knowledge_dir")
+
+    args = p.parse_args()
+    if args.cmd == "oauth":
+        return cmd_oauth()
+    if args.cmd == "send":
+        return cmd_send(args)
+    if args.cmd == "pull":
+        return cmd_pull(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## File: `backend/app/routers/health.py`
+
+```text
+from fastapi import APIRouter
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+## File: `backend/app/routers/chat.py`
+
+```text
+"""PHASE_1 chat endpoint — wire RAG + LLM in app.services.rag."""
+
+from typing import Any
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+
+from app.services.chat_agent import answer_with_tools_with_trace
+from app.services.rag import answer_query_with_trace
+
+router = APIRouter(prefix="/v1", tags=["chat"])
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=8000)
+    use_tools: bool = Field(
+        default=False,
+        description="Phase 2: enable OpenAI tool calling (RAG + Jira/Bitbucket stubs).",
+    )
+
+
+class SourceChunk(BaseModel):
+    """Indexed passage (e.g. Confluence export under data/knowledge/)."""
+
+    source: str
+    excerpt: str
+    distance: float | None = None
+
+
+class ToolStep(BaseModel):
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: str
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    trace_mode: str | None = Field(
+        default=None,
+        description="retrieved|direct|no_match|config|index_empty|agent — how the answer was produced.",
+    )
+    sources: list[SourceChunk] = Field(default_factory=list)
+    tool_steps: list[ToolStep] = Field(default_factory=list)
+
+
+@router.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    if req.use_tools:
+        answer, tool_steps = answer_with_tools_with_trace(req.message)
+        return ChatResponse(
+            answer=answer,
+            trace_mode="agent",
+            tool_steps=[ToolStep(**s) for s in tool_steps],
+        )
+    answer, sources, mode = answer_query_with_trace(req.message)
+    return ChatResponse(
+        answer=answer,
+        trace_mode=mode,
+        sources=[SourceChunk(**s) for s in sources],
+    )
+```
+
+## File: `backend/app/routers/demo_integration.py`
+
+```text
+"""Safe integration status for the demo UI (no secrets exposed)."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+
+from app.config import settings
+from app.tools.handlers import execute_tool
+
+router = APIRouter(prefix="/v1/demo", tags=["demo"])
+
+
+class GoogleChatSendBody(BaseModel):
+    """Post into a space via Chat API (same as google_chat_send_message tool)."""
+
+    space: str = ""
+    message: str = Field(..., min_length=1, max_length=4096)
+
+
+class JiraIssueCreateBody(BaseModel):
+    """Same fields as the jira_create_issue agent tool — bypasses the LLM."""
+
+    summary: str = Field(..., min_length=1, max_length=500)
+    description: str = ""
+    issue_type: str = "Task"
+
+
+@router.get("/integration-status")
+def integration_status():
+    """
+    Which integrations have env configured — booleans only.
+    Use with /ui/integrations.html for a live demo dashboard.
+    """
+    s = settings
+    base_url = (s.openai_base_url or "").strip()
+    api_key = (s.openai_api_key or "").strip()
+
+    if base_url:
+        llm = "local_openai_compatible"
+    elif api_key == "ollama":
+        llm = "local_openai_compatible"
+    elif api_key:
+        llm = "openai_cloud"
+    else:
+        llm = "none"
+
+    ca = (s.atlassian_ca_bundle or "").strip()
+    if ca:
+        atlassian_tls = "ca_bundle"
+    elif not s.atlassian_http_verify:
+        atlassian_tls = "insecure"
+    else:
+        atlassian_tls = "verify"
+
+    return {
+        "llm": llm,
+        "chroma_ingested_hint": True,
+        "atlassian_tls": atlassian_tls,
+        "jira": bool(
+            (s.jira_base_url or "").strip()
+            and (s.jira_email or "").strip()
+            and (s.jira_api_token or "").strip()
+            and (s.jira_default_project_key or "").strip()
+        ),
+        "bitbucket": bool(
+            (s.bitbucket_workspace or "").strip()
+            and (s.bitbucket_username or "").strip()
+            and (s.bitbucket_app_password or "").strip()
+        ),
+        "confluence": bool(
+            (s.confluence_base_url or "").strip()
+            and (s.confluence_user_email or "").strip()
+            and (s.confluence_api_token or "").strip()
+        ),
+        "google_chat_webhook": bool(s.google_chat_enabled),
+        "google_chat_incoming_webhook": bool((s.google_chat_incoming_webhook_url or "").strip()),
+        "google_chat_api": bool(
+            (s.google_chat_api_client_id or "").strip()
+            and (s.google_chat_api_refresh_token or "").strip()
+        ),
+        "gmail": bool((s.gmail_client_id or "").strip() and (s.gmail_refresh_token or "").strip()),
+    }
+
+
+@router.post("/jira-issue")
+def create_jira_issue(body: JiraIssueCreateBody):
+    """
+    Create a Jira issue using server `.env` (JIRA_*). Returns the same string as the agent tool
+    (success URL, API error, or `[Stub]` if not configured).
+    """
+    issue_type = (body.issue_type or "Task").strip() or "Task"
+    result = execute_tool(
+        "jira_create_issue",
+        {
+            "summary": body.summary.strip(),
+            "description": body.description or "",
+            "issue_type": issue_type,
+        },
+    )
+    return {"result": result}
+
+
+@router.post("/google-chat-send")
+def google_chat_send_demo(body: GoogleChatSendBody):
+    """Post a message to Google Chat using GOOGLE_CHAT_API_* OAuth (no LLM)."""
+    result = execute_tool(
+        "google_chat_send_message",
+        {"space": body.space.strip(), "message": body.message},
+    )
+    return {"result": result}
+```
+
+## File: `backend/app/routers/google_chat.py`
+
+```text
+"""Google Chat HTTP endpoint (Chat app → your FastAPI URL)."""
+
+from __future__ import annotations
+
+import logging
+
+from fastapi import APIRouter, Header, HTTPException, Request
+
+from app.config import settings
+from app.services.google_chat_handler import handle_google_chat_event
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1/integrations", tags=["integrations"])
+
+
+@router.post("/google-chat")
+async def google_chat_webhook(
+    request: Request,
+    x_chat_secret: str | None = Header(default=None, alias="X-Chat-Secret"),
+):
+    """
+    Configure this URL in Google Cloud Console → Chat API → your Chat app → HTTP endpoint.
+
+    **Note:** Product is **Google Chat** (spaces in chat.google.com). This is not Gmail email.
+    """
+    if not settings.google_chat_enabled:
+        raise HTTPException(status_code=503, detail="Google Chat integration disabled (set GOOGLE_CHAT_ENABLED=true)")
+
+    secret = (settings.google_chat_shared_secret or "").strip()
+    if secret and (x_chat_secret or "") != secret:
+        raise HTTPException(status_code=403, detail="Invalid X-Chat-Secret")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Expected JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
+    logger.debug("google-chat event keys=%s", list(payload.keys()))
+    return handle_google_chat_event(payload)
+```
+
+## File: `backend/app/services/chroma_store.py`
+
+```text
+"""Chroma persistent store for RAG."""
+
+from __future__ import annotations
+
+import chromadb
+from chromadb.api.models.Collection import Collection
+
+from app.config import settings
+
+
+def get_collection() -> Collection:
+    settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(settings.chroma_persist_dir))
+    return client.get_or_create_collection(
+        name=settings.chroma_collection,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def collection_count() -> int:
+    col = get_collection()
+    return col.count()
+```
+
+## File: `backend/app/services/embeddings.py`
+
+```text
+"""OpenAI embeddings for ingest + query."""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+from openai import OpenAI
+
+from app.config import settings
+
+
+def get_client() -> OpenAI | None:
+    """
+    OpenAI Cloud: set OPENAI_API_KEY only.
+
+    Local LLM (Ollama, etc.): set OPENAI_BASE_URL (e.g. http://localhost:11434/v1).
+    Pull chat + embedding models first, then set CHAT_MODEL / EMBEDDING_MODEL to match Ollama names.
+    """
+    base = (settings.openai_base_url or "").strip()
+    key = (settings.openai_api_key or "").strip()
+    if base:
+        return OpenAI(api_key=key or "ollama", base_url=base.rstrip("/"))
+    if key:
+        return OpenAI(api_key=key)
+    return None
+
+
+def embed_texts(texts: Sequence[str]) -> list[list[float]]:
+    client = get_client()
+    if not client:
+        raise RuntimeError(
+            "No LLM client: set OPENAI_API_KEY or OPENAI_BASE_URL (see docs/LOCAL_LLM.md)."
+        )
+    resp = client.embeddings.create(
+        model=settings.embedding_model,
+        input=list(texts),
+    )
+    return [d.embedding for d in resp.data]
+
+
+def embed_query(text: str) -> list[float]:
+    return embed_texts([text])[0]
+```
+
+## File: `backend/app/services/ingestion.py`
+
+```text
+"""PHASE_1: Chunk, embed, upsert into Chroma."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from pathlib import Path
+
+from app.config import settings
+from app.services.chroma_store import get_collection
+from app.services.embeddings import embed_texts
+
+logger = logging.getLogger(__name__)
+
+MAX_CHUNK_CHARS = 1200
+OVERLAP_CHARS = 150
+
+
+def _chunk_text(text: str, source_id: str) -> list[tuple[str, str]]:
+    """Return list of (chunk_id, chunk_text) using sliding windows."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks: list[tuple[str, str]] = []
+    i = 0
+    idx = 0
+    while i < len(text):
+        piece = text[i : i + MAX_CHUNK_CHARS].strip()
+        if not piece:
+            break
+        cid = _chunk_hash(source_id, idx, piece)
+        chunks.append((cid, piece))
+        idx += 1
+        i += max(1, MAX_CHUNK_CHARS - OVERLAP_CHARS)
+    return chunks
+
+
+def _chunk_hash(source_id: str, idx: int, content: str) -> str:
+    h = hashlib.sha256(f"{source_id}:{idx}:{content}".encode()).hexdigest()[:24]
+    return f"{source_id}:{idx}:{h}"
+
+
+def ingest_file(path: Path, source_id: str | None = None) -> int:
+    """Ingest one text/markdown file. Returns number of chunks added."""
+    sid = source_id or path.name
+    text = path.read_text(encoding="utf-8", errors="replace")
+    pairs = _chunk_text(text, sid)
+    if not pairs:
+        return 0
+    ids = [p[0] for p in pairs]
+    documents = [p[1] for p in pairs]
+    embeddings = embed_texts(documents)
+    col = get_collection()
+    col.upsert(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=[{"source": sid, "path": str(path)} for _ in ids],
+    )
+    logger.info("ingested %s chunks from %s", len(ids), path)
+    return len(ids)
+
+
+def ingest_directory(directory: Path | None = None) -> dict[str, int]:
+    """Ingest all `.md` and `.txt` files under directory. Returns stats per file."""
+    root = directory or settings.knowledge_dir
+    root = root.resolve()
+    if not root.is_dir():
+        logger.warning("knowledge directory does not exist: %s", root)
+        return {}
+    stats: dict[str, int] = {}
+    for pattern in ("**/*.md", "**/*.txt"):
+        for path in root.glob(pattern):
+            if path.is_file():
+                n = ingest_file(path, source_id=str(path.relative_to(root)))
+                stats[str(path.relative_to(root))] = n
+    return stats
+```
+
+## File: `backend/app/services/query_router.py`
+
+```text
+"""Adaptive RAG: decide whether to hit the vector index (latency + cost)."""
+
+from __future__ import annotations
+
+import re
+
+from app.config import settings
+
+# Short greetings / thanks — no company docs needed
+_GREETING = re.compile(
+    r"^(hi|hello|hey|thanks|thank you|good morning|good afternoon|good evening|ok|okay)[\s!?.]*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def should_retrieve(user_message: str) -> bool:
+    """Return False when we can answer without Chroma."""
+    if not settings.adaptive_rag_enabled:
+        return True
+    m = user_message.strip()
+    if len(m) <= 2:
+        return False
+    if len(m) < 100 and _GREETING.match(m):
+        return False
+    return True
+```
+
+## File: `backend/app/services/hyde.py`
+
+```text
+"""HyDE — hypothetical document for better retrieval on vague queries (optional)."""
+
+from __future__ import annotations
+
+import logging
+
+from app.config import settings
+from app.services.embeddings import get_client
+
+logger = logging.getLogger(__name__)
+
+HYDE_SYSTEM = """You write a short hypothetical passage (2–4 sentences) that could appear in internal docs
+and would help answer the user's question. Use generic wording; do NOT invent company-specific names,
+numbers, or secrets. If the question is too vague, describe what kind of document would answer it."""
+
+
+def expand_query_for_retrieval(user_message: str) -> str:
+    """Return text to embed for vector search (original question or HyDE paragraph)."""
+    if not settings.rag_hyde_enabled:
+        return user_message
+    client = get_client()
+    if not client:
+        return user_message
+    try:
+        r = client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[
+                {"role": "system", "content": HYDE_SYSTEM},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.25,
+            max_tokens=256,
+        )
+        hypo = (r.choices[0].message.content or "").strip()
+        if len(hypo) < 20:
+            return user_message
+        logger.debug("HyDE retrieval text: %s", hypo[:200])
+        return hypo
+    except Exception as e:
+        logger.warning("HyDE failed, falling back to raw query: %s", e)
+        return user_message
+```
+
+## File: `backend/app/services/rag.py`
+
+```text
+"""RAG: Adaptive + optional HyDE + Chroma retrieval + OpenAI chat."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from app.config import settings
+from app.services.chroma_store import collection_count, get_collection
+from app.services.embeddings import embed_query, get_client
+from app.services.hyde import expand_query_for_retrieval
+from app.services.query_router import should_retrieve
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are a helpful internal assistant. Answer using ONLY the context excerpts below.
+If the context is insufficient, say what is missing and suggest what to look up. Do not invent facts."""
+
+SYSTEM_DIRECT = """You are a helpful assistant for an internal engineering team.
+Answer briefly and clearly. You do not have access to private indexed documents in this turn — do not pretend to quote internal wiki content."""
+
+
+def _retrieval_pairs(
+    retrieval_query: str,
+) -> tuple[list[tuple[str, dict, float]], bool]:
+    """Chroma retrieval after distance filter. Second value: True if Chroma returned any document row."""
+    q_emb = embed_query(retrieval_query)
+    col = get_collection()
+    n = min(settings.retrieve_top_k, max(1, collection_count()))
+    res = col.query(
+        query_embeddings=[q_emb],
+        n_results=n,
+        include=["documents", "metadatas", "distances"],
+    )
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
+
+    if not docs:
+        return [], False
+
+    pairs: list[tuple[str, dict, float]] = []
+    for i, doc in enumerate(docs):
+        d = dists[i] if i < len(dists) else 0.0
+        meta = metas[i] if i < len(metas) else {}
+        if settings.retrieve_max_distance is not None and d > settings.retrieve_max_distance:
+            continue
+        pairs.append((doc, meta if isinstance(meta, dict) else {}, float(d)))
+    return pairs, True
+
+
+def _format_context_from_pairs(pairs: list[tuple[str, dict, float]]) -> str:
+    context_blocks = []
+    for doc, meta, _ in pairs:
+        src = meta.get("source", "unknown")
+        context_blocks.append(f"---\nSource: {src}\n{doc}\n")
+    return "\n".join(context_blocks)
+
+
+def sources_from_pairs(pairs: list[tuple[str, dict, float]], excerpt_max: int = 1200) -> list[dict[str, Any]]:
+    """Structured chunks for API/UI (Confluence export paths show up as `source`)."""
+    out: list[dict[str, Any]] = []
+    for doc, meta, d in pairs[:12]:
+        ex = doc if len(doc) <= excerpt_max else doc[:excerpt_max] + "…"
+        out.append(
+            {
+                "source": str(meta.get("source", "unknown")),
+                "excerpt": ex,
+                "distance": round(float(d), 4),
+            }
+        )
+    return out
+
+
+def fetch_rag_context(retrieval_query: str) -> str:
+    """Embed `retrieval_query`, query Chroma, return formatted context or status string."""
+    client = get_client()
+    if not client:
+        return (
+            "[Config] Set OPENAI_API_KEY or OPENAI_BASE_URL (local LLM) — docs/LOCAL_LLM.md. "
+            "Then run: cd backend && python -m app.cli_ingest"
+        )
+    if collection_count() == 0:
+        return (
+            "[Index empty] No documents ingested yet. Add files under data/knowledge/ "
+            "and run: cd backend && python -m app.cli_ingest"
+        )
+    pairs, had_rows = _retrieval_pairs(retrieval_query)
+    if not pairs:
+        if not had_rows:
+            return "No matching chunks found. Try rephrasing or add more docs to data/knowledge/."
+        return (
+            "No chunks passed the relevance threshold. Try rephrasing, add docs, "
+            "or adjust RETRIEVE_MAX_DISTANCE in .env."
+        )
+    return _format_context_from_pairs(pairs)
+
+
+def retrieve_context(query: str) -> str:
+    """Public API for tools: retrieve using `query` as the embedding text."""
+    return fetch_rag_context(query)
+
+
+def answer_direct(user_message: str) -> str:
+    """LLM answer without indexed context (Adaptive RAG fast path)."""
+    chat = get_client()
+    if not chat:
+        return (
+            "[Config] Set OPENAI_API_KEY or OPENAI_BASE_URL (e.g. Ollama) in .env — see docs/LOCAL_LLM.md"
+        )
+    completion = chat.chat.completions.create(
+        model=settings.chat_model,
+        messages=[
+            {"role": "system", "content": SYSTEM_DIRECT},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.3,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+def answer_query_with_trace(
+    user_message: str,
+) -> tuple[str, list[dict[str, Any]], str]:
+    """Returns (answer, sources, trace_mode). trace_mode: config|direct|index_empty|retrieved|no_match."""
+    client = get_client()
+    if not client:
+        return (
+            "[Config] Set OPENAI_API_KEY (cloud) or OPENAI_BASE_URL (local LLM, e.g. Ollama) — docs/LOCAL_LLM.md. "
+            "Then run: cd backend && python -m app.cli_ingest",
+            [],
+            "config",
+        )
+
+    if settings.adaptive_rag_enabled and not should_retrieve(user_message):
+        return answer_direct(user_message), [], "direct"
+
+    if collection_count() == 0:
+        return (
+            "[Index empty] No documents ingested yet. Add files under data/knowledge/ "
+            "and run: cd backend && python -m app.cli_ingest",
+            [],
+            "index_empty",
+        )
+
+    retrieval_query = expand_query_for_retrieval(user_message)
+    pairs, _had_rows = _retrieval_pairs(retrieval_query)
+    if not pairs:
+        hint = answer_direct(
+            f"The user asked: {user_message}\n"
+            "No relevant indexed passages were found. Reply helpfully and suggest what they could add "
+            "to the knowledge base or how to rephrase."
+        )
+        return hint, [], "no_match"
+
+    sources = sources_from_pairs(pairs)
+    context = _format_context_from_pairs(pairs)
+    chat = get_client()
+    if not chat:
+        return (
+            "[Config] Set OPENAI_API_KEY or OPENAI_BASE_URL — see docs/LOCAL_LLM.md",
+            sources,
+            "config",
+        )
+    completion = chat.chat.completions.create(
+        model=settings.chat_model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {user_message}"},
+        ],
+        temperature=0.2,
+    )
+    out = completion.choices[0].message.content or ""
+    logger.info("rag answer length=%s", len(out))
+    return out.strip(), sources, "retrieved"
+
+
+def answer_query(user_message: str) -> str:
+    return answer_query_with_trace(user_message)[0]
+```
+
+## File: `backend/app/services/chat_agent.py`
+
+```text
+"""Phase 2: OpenAI chat with tool loop (RAG + Jira + Bitbucket)."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from app.config import settings
+from app.services.embeddings import get_client
+from app.tools.handlers import run_tool_call
+from app.tools.registry import OPENAI_TOOLS
+
+logger = logging.getLogger(__name__)
+
+AGENT_SYSTEM = """You are an internal assistant for engineers.
+- Use search_internal_knowledge for questions about docs, policies, runbooks, and indexed code notes.
+- Use jira_create_issue when the user explicitly wants a ticket filed.
+- You cannot fetch or search existing Jira issues by key (e.g. CCS-401); do not pretend to. Only create via the tool.
+- Use bitbucket_list_repositories when the user asks what repos exist in a workspace.
+- Use google_chat_send_message when the user wants to post text into a Google Chat space (OAuth); not the same as the inbound Chat webhook bot.
+- If tools return [Stub] or [Config], explain what env vars are needed.
+- jira_create_issue accepts ONLY: summary, description, issue_type. Never add verify, ssl, insecure, or HTTP client parameters — they are not valid tool arguments.
+- Never invent CLI commands for tools (e.g. jira_create_issue --insecure does not exist). Jira HTTPS is configured only in the server .env (ATLASSIAN_HTTP_VERIFY, ATLASSIAN_CA_BUNDLE) and restart.
+- If Jira/Bitbucket fails with SSL/TLS errors: tell the user to edit local-ai-assistant/.env — set ATLASSIAN_CA_BUNDLE=/path/to/corp.pem (preferred) or ATLASSIAN_HTTP_VERIFY=false for local dev — then restart the API. Do not claim Atlassian Cloud uses a self-signed cert; do not suggest verify=False, --insecure, Python requests/httpx kwargs, Java, or curl.
+- Be concise and accurate."""
+
+
+def answer_with_tools_with_trace(user_message: str) -> tuple[str, list[dict[str, Any]]]:
+    """Returns (final_answer, tool_steps) for UI: Jira, Bitbucket, search_internal_knowledge, etc."""
+    tool_steps: list[dict[str, Any]] = []
+    client = get_client()
+    if not client:
+        return (
+            "[Config] Set OPENAI_API_KEY or OPENAI_BASE_URL (local LLM) — docs/LOCAL_LLM.md. "
+            "Then ingest docs and optionally configure Jira/Bitbucket env vars.",
+            [],
+        )
+
+    oa = client
+    messages: list[dict] = [
+        {"role": "system", "content": AGENT_SYSTEM},
+        {"role": "user", "content": user_message},
+    ]
+
+    for _round_i in range(settings.agent_max_tool_rounds):
+        resp = oa.chat.completions.create(
+            model=settings.chat_model,
+            messages=messages,
+            tools=OPENAI_TOOLS,
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        choice = resp.choices[0]
+        msg = choice.message
+
+        if not msg.tool_calls:
+            return (msg.content or "").strip(), tool_steps
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        )
+
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = tc.function.arguments or "{}"
+            logger.info("tool %s args=%s", name, args[:200])
+            result = run_tool_call(name, args)
+            try:
+                arg_obj: dict[str, Any] = json.loads(args or "{}")
+            except json.JSONDecodeError:
+                arg_obj = {}
+            preview = result[:8000]
+            tool_steps.append({"tool": name, "arguments": arg_obj, "result": preview})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result[:12000],
+                }
+            )
+
+    return "[Agent] Max tool rounds exceeded; refine your question.", tool_steps
+
+
+def answer_with_tools(user_message: str) -> str:
+    return answer_with_tools_with_trace(user_message)[0]
+```
+
+## File: `backend/app/services/google_chat_handler.py`
+
+```text
+"""Parse Google Chat HTTP events and produce reply text."""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from app.config import settings
+from app.services.chat_agent import answer_with_tools
+from app.services.rag import answer_query
+
+logger = logging.getLogger(__name__)
+
+_MENTION = re.compile(r"^<users/[^>]+>\s*")
+
+
+def _allowed_space(space_name: str) -> bool:
+    raw = (settings.google_chat_allowed_spaces or "").strip()
+    if not raw:
+        return True
+    allowed = {s.strip() for s in raw.split(",") if s.strip()}
+    return space_name in allowed
+
+
+def _strip_mentions(text: str) -> str:
+    t = _MENTION.sub("", text)
+    return t.strip()
+
+
+def handle_google_chat_event(payload: dict[str, Any]) -> dict[str, str]:
+    """
+    Return a Google Chat response object, e.g. {"text": "..."}.
+    https://developers.google.com/chat/api/guides/message-formats/basic
+    """
+    typ = str(payload.get("type") or payload.get("eventType") or "").upper()
+
+    if typ in ("ADDED_TO_SPACE", "ADDED_TO_DM"):
+        return {
+            "text": (
+                "Local AI Assistant is connected.\n"
+                "I answer from your ingested knowledge base (RAG). "
+                "Use the REST API flag for tools (Jira/Bitbucket) if enabled.\n"
+                "Say *help* for tips."
+            )
+        }
+
+    if typ in ("REMOVED_FROM_SPACE", "REMOVED_FROM_DM"):
+        return {"text": ""}
+
+    if typ != "MESSAGE":
+        logger.info("Ignoring Google Chat event type=%s", typ)
+        return {"text": ""}
+
+    msg = payload.get("message") or {}
+    raw_text = (msg.get("text") or "").strip()
+    text = _strip_mentions(raw_text)
+    space_name = (payload.get("space") or {}).get("name") or ""
+
+    if space_name and not _allowed_space(space_name):
+        return {"text": "This Chat space is not on the allowlist for this deployment."}
+
+    if not text:
+        return {"text": "Send a text message (or type *help*)."}
+
+    low = text.lower()
+    if low in ("help", "help!", "/help"):
+        return {
+            "text": (
+                "*Commands*\n"
+                "• Ask any question — I search your indexed docs (RAG).\n"
+                "• Prefix with `!tools ` to use Jira/Bitbucket tools (if configured).\n"
+                "• API: `POST /v1/chat` with `use_tools` for the same agent.\n"
+                "Docs: see `docs/GOOGLE_CHAT.md` in the repo."
+            )
+        }
+
+    use_tools = text.lower().startswith("!tools ")
+    if use_tools:
+        text = text[7:].strip() or "What tools are available?"
+
+    try:
+        if use_tools and settings.google_chat_use_tools:
+            reply = answer_with_tools(text)
+        else:
+            reply = answer_query(text)
+    except Exception as e:
+        logger.exception("Google Chat handler error")
+        reply = f"Error: {e!s}"
+
+    # Chat message length limits — trim safely
+    if len(reply) > 4000:
+        reply = reply[:3990] + "\n…(truncated)"
+    return {"text": reply}
+```
+
+## File: `backend/app/tools/__init__.py`
+
+```text
+"""Phase 2 tools — see registry.py, handlers.py and docs/INTEGRATIONS.md."""
+```
+
+## File: `backend/app/tools/registry.py`
+
+```text
+"""OpenAI-compatible tool definitions for Phase 2 agent."""
+
+from __future__ import annotations
+
+# Passed to chat.completions.create(..., tools=OPENAI_TOOLS)
+OPENAI_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_internal_knowledge",
+            "description": (
+                "Search indexed internal docs (Confluence export, markdown, runbooks) "
+                "and return relevant excerpts. Use for policy, architecture, how-to questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query in natural language",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "jira_create_issue",
+            "description": (
+                "Create a Jira issue in the default project. Arguments: summary, description, issue_type only. "
+                "No verify/ssl/insecure parameters. TLS is fixed in server .env (ATLASSIAN_HTTP_VERIFY, ATLASSIAN_CA_BUNDLE), not in this call. "
+                "Returns a stub if Jira env vars are not set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "description": {"type": "string"},
+                    "issue_type": {
+                        "type": "string",
+                        "description": "Usually Task or Bug",
+                        "default": "Task",
+                    },
+                },
+                "required": ["summary", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bitbucket_list_repositories",
+            "description": (
+                "List repositories in a Bitbucket workspace. Requires Bitbucket credentials in env."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Bitbucket workspace slug (defaults to BITBUCKET_WORKSPACE)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "google_chat_list_spaces",
+            "description": (
+                "List Google Chat spaces the signed-in user belongs to (chat.google.com). "
+                "Uses OAuth (GOOGLE_CHAT_API_* env). For Workspace office accounts — not Gmail email."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_size": {
+                        "type": "integer",
+                        "description": "Max spaces to list (1–100, default 25)",
+                        "default": 25,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "google_chat_recent_messages",
+            "description": (
+                "Read recent messages from a Google Chat space (Workspace or consumer). "
+                "Parameter space is the resource name like spaces/AAAA... (from list_spaces or Chat UI). "
+                "Prefer this over Gmail for office chat history."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "space": {
+                        "type": "string",
+                        "description": "Space name, e.g. spaces/xxxxx. If omitted, uses GOOGLE_CHAT_API_DEFAULT_SPACE.",
+                    },
+                    "max_messages": {
+                        "type": "integer",
+                        "description": "Max messages (1–50, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "google_chat_send_message",
+            "description": (
+                "Post plain text to Google Chat. If GOOGLE_CHAT_INCOMING_WEBHOOK_URL is set (incoming webhook from the space, "
+                "like Slack), uses that and ignores space. Otherwise uses Chat API OAuth; space is spaces/AAAA... or default in .env."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "space": {
+                        "type": "string",
+                        "description": "Space name, e.g. spaces/xxxxx. If omitted, uses GOOGLE_CHAT_API_DEFAULT_SPACE.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Text to post (max ~4096 chars)",
+                    },
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_search",
+            "description": (
+                "Search the user's Gmail (readonly). Uses Gmail search syntax (same as the Gmail UI). "
+                "Returns subject lines and truncated excerpts. Requires GMAIL_* OAuth env vars."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Gmail search query, e.g. from:support@company.com newer_than:7d",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max messages to return (1–20, default 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+```
+
+## File: `backend/app/tools/handlers.py`
+
+```text
+"""Execute tool calls — real HTTP when env configured, else safe stubs."""
+
+from __future__ import annotations
+
+import json
+import logging
+import ssl
+from typing import Any
+
+from app.atlassian_httpx import (
+    atlassian_httpx_Client,
+    atlassian_httpx_insecure_plain_client,
+    jira_post_json_ssl_unverified,
+)
+from app.config import settings
+from app.connectors.gmail import gmail_oauth_configured, search_messages_formatted
+from app.connectors.google_chat_api import (
+    google_chat_api_configured,
+    list_recent_messages_formatted,
+    list_spaces_formatted,
+    post_message_to_space,
+)
+from app.connectors.google_chat_incoming_webhook import post_incoming_webhook
+from app.services.rag import retrieve_context
+
+logger = logging.getLogger(__name__)
+
+
+def _is_likely_ssl_error(exc: BaseException) -> bool:
+    if isinstance(exc, ssl.SSLError):
+        return True
+    n = type(exc).__name__.lower()
+    if "ssl" in n or "tls" in n:
+        return True
+    msg = (str(exc) + " " + repr(exc)).lower()
+    return any(
+        k in msg
+        for k in (
+            "ssl",
+            "tls",
+            "certificate",
+            "cert verify",
+            "certificate_verify_failed",
+            "hostname",
+            "verification",
+            "openssl",
+            "handshake",
+            "unexpected_eof",
+            "eof occurred",
+            "issuer certificate",
+        )
+    )
+
+
+def _is_likely_ssl_error_chain(exc: BaseException | None) -> bool:
+    """Walk exception graph — httpx may put SSLError in __context__ while __cause__ is set elsewhere."""
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack and len(seen) < 32:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if _is_likely_ssl_error(cur):
+            return True
+        c1 = getattr(cur, "__cause__", None)
+        c2 = getattr(cur, "__context__", None)
+        if c1 is not None:
+            stack.append(c1)
+        if c2 is not None:
+            stack.append(c2)
+        eg = getattr(cur, "exceptions", None)
+        if eg:
+            for sub in eg:
+                stack.append(sub)
+    return False
+
+
+def execute_tool(name: str, arguments: dict[str, Any]) -> str:
+    if name == "search_internal_knowledge":
+        q = arguments.get("query") or ""
+        return retrieve_context(q) if q else "Missing query."
+    if name == "jira_create_issue":
+        return _jira_create_issue(
+            summary=str(arguments.get("summary", "")),
+            description=str(arguments.get("description", "")),
+            issue_type=str(arguments.get("issue_type") or "Task"),
+        )
+    if name == "bitbucket_list_repositories":
+        ws = arguments.get("workspace") or settings.bitbucket_workspace
+        return _bitbucket_list_repos(str(ws) if ws else "")
+    if name == "google_chat_list_spaces":
+        return _google_chat_list_spaces(int(arguments.get("page_size") or 25))
+    if name == "google_chat_recent_messages":
+        return _google_chat_recent_messages(
+            str(arguments.get("space") or "").strip(),
+            int(arguments.get("max_messages") or 10),
+        )
+    if name == "google_chat_send_message":
+        return _google_chat_send_message(
+            str(arguments.get("space") or "").strip(),
+            str(arguments.get("message") or arguments.get("text") or ""),
+        )
+    if name == "gmail_search":
+        return _gmail_search(
+            str(arguments.get("query") or ""),
+            int(arguments.get("max_results") or 5),
+        )
+    return f"Unknown tool: {name}"
+
+
+def _jira_create_issue(summary: str, description: str, issue_type: str) -> str:
+    base = settings.jira_base_url.rstrip("/")
+    if not all([base, settings.jira_email, settings.jira_api_token, settings.jira_default_project_key]):
+        return (
+            "[Stub] Jira not configured. Set JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, "
+            "JIRA_DEFAULT_PROJECT_KEY in .env to create real issues. "
+            f"Would create [{issue_type}] {summary!r}"
+        )
+    url = f"{base}/rest/api/3/issue"
+    payload = {
+        "fields": {
+            "project": {"key": settings.jira_default_project_key},
+            "summary": summary[:255],
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": description[:32000]}],
+                    }
+                ],
+            },
+            "issuetype": {"name": issue_type},
+        }
+    }
+    auth = (settings.jira_email, settings.jira_api_token)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    r = None
+    try:
+        with atlassian_httpx_Client(timeout=30.0) as client:
+            r = client.post(url, json=payload, auth=auth, headers=headers)
+    except Exception as e:
+        if not _is_likely_ssl_error_chain(e):
+            logger.exception("Jira create failed")
+            return f"Jira request failed: {e}"
+        logger.warning("Jira TLS (1/3 httpx): %s", e)
+        try:
+            with atlassian_httpx_insecure_plain_client(timeout=30.0) as client:
+                r = client.post(url, json=payload, auth=auth, headers=headers)
+        except Exception as e2:
+            logger.warning("Jira TLS (2/3 httpx insecure): %s", e2)
+            try:
+                code, body = jira_post_json_ssl_unverified(url, payload, auth)
+            except Exception as e3:
+                logger.exception("Jira TLS (3/3 urllib) failed")
+                return (
+                    f"Jira request failed after TLS fallbacks: {e3}. "
+                    "Set ATLASSIAN_HTTP_VERIFY=false in local-ai-assistant/.env, restart the API, "
+                    "or add ATLASSIAN_CA_BUNDLE with your corporate CA. "
+                    "Do not use CLI flags — this is server config only (docs/INTEGRATIONS.md)."
+                )
+            if code >= 400:
+                logger.warning("Jira error %s: %s", code, body[:500])
+                return f"Jira API error {code}: {body[:500]!r}"
+            data = json.loads(body.decode())
+            key = data.get("key", "?")
+            return f"Created Jira issue {key} ({base}/browse/{key}) [TLS: urllib fallback]"
+    if r is None:
+        return "Jira request failed: no response"
+    if r.status_code >= 400:
+        logger.warning("Jira error %s: %s", r.status_code, r.text[:500])
+        return f"Jira API error {r.status_code}: {r.text[:500]}"
+    data = r.json()
+    key = data.get("key", "?")
+    return f"Created Jira issue {key} ({base}/browse/{key})"
+
+
+def _google_chat_list_spaces(page_size: int) -> str:
+    if not google_chat_api_configured():
+        return (
+            "[Stub] Google Chat API not configured. For office Chat (spaces), set "
+            "GOOGLE_CHAT_API_CLIENT_ID, GOOGLE_CHAT_API_CLIENT_SECRET, GOOGLE_CHAT_API_REFRESH_TOKEN "
+            "and run: python -m app.cli_google_chat_api oauth — see docs/GOOGLE_CHAT.md"
+        )
+    try:
+        ps = max(1, min(page_size, 100))
+        return list_spaces_formatted(page_size=ps)
+    except Exception as e:
+        logger.exception("Google Chat list spaces failed")
+        return f"Google Chat API error: {e}"
+
+
+def _google_chat_recent_messages(space: str, max_messages: int) -> str:
+    if not google_chat_api_configured():
+        return (
+            "[Stub] Google Chat API not configured. Use Workspace Chat (not Gmail mail): "
+            "docs/GOOGLE_CHAT.md — python -m app.cli_google_chat_api oauth"
+        )
+    resolved = space or (settings.google_chat_api_default_space or "").strip()
+    if not resolved:
+        return (
+            "Missing space. Pass space like spaces/AAAA... or set GOOGLE_CHAT_API_DEFAULT_SPACE in .env. "
+            "Use google_chat_list_spaces to discover space names."
+        )
+    try:
+        mm = max(1, min(max_messages, 50))
+        return list_recent_messages_formatted(resolved, max_messages=mm)
+    except Exception as e:
+        logger.exception("Google Chat recent messages failed")
+        return f"Google Chat API error: {e}"
+
+
+def _google_chat_send_message(space: str, message: str) -> str:
+    if not (message or "").strip():
+        return "Missing message text."
+
+    hook = (settings.google_chat_incoming_webhook_url or "").strip()
+    if hook:
+        try:
+            return post_incoming_webhook(hook, message)
+        except Exception as e:
+            logger.exception("Google Chat incoming webhook failed")
+            return f"Google Chat webhook error: {e}"
+
+    if not google_chat_api_configured():
+        return (
+            "[Stub] Google Chat post not configured. Either:\n"
+            "• Slack-style: set GOOGLE_CHAT_INCOMING_WEBHOOK_URL to the incoming webhook URL from your Chat space "
+            "(Manage webhooks / incoming webhook — see docs/GOOGLE_CHAT.md), or\n"
+            "• OAuth: set GOOGLE_CHAT_API_CLIENT_ID, GOOGLE_CHAT_API_CLIENT_SECRET, GOOGLE_CHAT_API_REFRESH_TOKEN "
+            "and run `python -m app.cli_google_chat_api oauth`."
+        )
+    resolved = space or (settings.google_chat_api_default_space or "").strip()
+    if not resolved:
+        return (
+            "Missing space. Pass space like spaces/AAAA... or set GOOGLE_CHAT_API_DEFAULT_SPACE in .env. "
+            "Use google_chat_list_spaces to discover space names."
+        )
+    try:
+        return post_message_to_space(resolved, message)
+    except Exception as e:
+        logger.exception("Google Chat send message failed")
+        return f"Google Chat API error: {e}"
+
+
+def _gmail_search(query: str, max_results: int) -> str:
+    if not query.strip():
+        return "Missing query."
+    if not gmail_oauth_configured():
+        return (
+            "[Stub] Gmail not configured. Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, "
+            "GMAIL_REFRESH_TOKEN (see docs/GMAIL.md). Would search Gmail for "
+            f"{query!r}"
+        )
+    try:
+        mr = max(1, min(max_results, 20))
+        return search_messages_formatted(query, max_results=mr)
+    except Exception as e:
+        logger.exception("Gmail search failed")
+        return f"Gmail request failed: {e}"
+
+
+def _bitbucket_list_repos(workspace: str) -> str:
+    ws = workspace or settings.bitbucket_workspace
+    if not ws or not settings.bitbucket_username or not settings.bitbucket_app_password:
+        return (
+            "[Stub] Bitbucket not configured. Set BITBUCKET_WORKSPACE, BITBUCKET_USERNAME, "
+            "BITBUCKET_APP_PASSWORD. Would list repos for workspace "
+            f"{ws or '(none)'!r}"
+        )
+    url = f"https://api.bitbucket.org/2.0/repositories/{ws}"
+    auth = (settings.bitbucket_username, settings.bitbucket_app_password)
+    try:
+        with atlassian_httpx_Client(timeout=30.0) as client:
+            r = client.get(url, auth=auth, params={"pagelen": 20})
+    except Exception as e:
+        if not _is_likely_ssl_error_chain(e):
+            logger.exception("Bitbucket list failed")
+            return f"Bitbucket request failed: {e}"
+        logger.warning("Bitbucket TLS error, retrying with plain verify=False: %s", e)
+        try:
+            with atlassian_httpx_insecure_plain_client(timeout=30.0) as client:
+                r = client.get(url, auth=auth, params={"pagelen": 20})
+        except Exception as e2:
+            logger.exception("Bitbucket failed after TLS retry")
+            return f"Bitbucket request failed: {e2}"
+    if r.status_code >= 400:
+        return f"Bitbucket API error {r.status_code}: {r.text[:500]}"
+    data = r.json()
+    values = data.get("values") or []
+    lines = [f"- {v.get('name')} ({v.get('full_name')})" for v in values[:20]]
+    return "Repositories:\n" + ("\n".join(lines) if lines else "(empty)")
+
+
+def run_tool_call(name: str, arguments_json: str) -> str:
+    try:
+        args = json.loads(arguments_json or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    return execute_tool(name, args)
+```
+
+## File: `backend/app/connectors/__init__.py`
+
+```text
+"""External data connectors (Confluence, Bitbucket, etc.)."""
+```
+
+## File: `backend/app/connectors/confluence.py`
+
+```text
+"""Fetch Confluence pages into data/knowledge/confluence/ for re-ingestion."""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from urllib.parse import urljoin
+
+from app.atlassian_httpx import atlassian_httpx_Client
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_html(html: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_space_to_markdown(space_key: str, out_dir: Path) -> list[Path]:
+    """Download pages from a Confluence space; write .md files. Returns written paths."""
+    base = settings.confluence_base_url.rstrip("/")
+    user = settings.confluence_user_email
+    token = settings.confluence_api_token
+    if not all([base, user, token]):
+        raise RuntimeError(
+            "Set CONFLUENCE_BASE_URL, CONFLUENCE_USER_EMAIL, CONFLUENCE_API_TOKEN in .env"
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    api = urljoin(base + "/", "rest/api/content")
+    written: list[Path] = []
+    start = 0
+    limit = 25
+    auth = (user, token)
+    headers = {"Accept": "application/json"}
+    with atlassian_httpx_Client(timeout=60.0) as client:
+        while True:
+            r = client.get(
+                api,
+                auth=auth,
+                headers=headers,
+                params={
+                    "spaceKey": space_key,
+                    "expand": "body.storage,version",
+                    "limit": limit,
+                    "start": start,
+                },
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(f"Confluence API {r.status_code}: {r.text[:800]}")
+            data = r.json()
+            results = data.get("results") or []
+            if not results:
+                break
+            for page in results:
+                pid = page.get("id", "unknown")
+                title = page.get("title", "untitled")
+                body = (page.get("body") or {}).get("storage") or {}
+                raw = body.get("value") or ""
+                text = _strip_html(raw) if raw else ""
+                safe_title = re.sub(r"[^\w\s-]", "", title)[:80].strip() or "page"
+                fname = f"{pid}_{safe_title.replace(' ', '_')}.md"
+                path = out_dir / fname
+                header = f"# {title}\n\n<!-- confluence_id={pid} space={space_key} -->\n\n"
+                path.write_text(header + text, encoding="utf-8")
+                written.append(path)
+                logger.info("wrote %s", path.name)
+            if len(results) < limit:
+                break
+            start += limit
+
+    return written
+```
+
+## File: `backend/app/connectors/google_chat_api.py`
+
+```text
+"""Google Chat API (user OAuth) — list spaces and read messages for Workspace Chat."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# User OAuth — same pattern as Gmail; use with your office Workspace account (chat.google.com).
+CHAT_API_SCOPES = [
+    "https://www.googleapis.com/auth/chat.spaces.readonly",
+    "https://www.googleapis.com/auth/chat.messages.readonly",
+    # Post text into a space as the signed-in user (spaces.messages.create)
+    "https://www.googleapis.com/auth/chat.messages",
+]
+
+
+def google_chat_api_configured() -> bool:
+    return bool(
+        (settings.google_chat_api_client_id or "").strip()
+        and (settings.google_chat_api_client_secret or "").strip()
+        and (settings.google_chat_api_refresh_token or "").strip()
+    )
+
+
+def build_credentials() -> Credentials:
+    if not google_chat_api_configured():
+        raise RuntimeError(
+            "Set GOOGLE_CHAT_API_CLIENT_ID, GOOGLE_CHAT_API_CLIENT_SECRET, "
+            "GOOGLE_CHAT_API_REFRESH_TOKEN in .env (see docs/GOOGLE_CHAT.md — Chat API OAuth)"
+        )
+    creds = Credentials(
+        token=None,
+        refresh_token=settings.google_chat_api_refresh_token.strip(),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.google_chat_api_client_id.strip(),
+        client_secret=settings.google_chat_api_client_secret.strip(),
+        scopes=CHAT_API_SCOPES,
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def _service():
+    return build("chat", "v1", credentials=build_credentials(), cache_discovery=False)
+
+
+def _normalize_space_name(space: str) -> str:
+    s = space.strip()
+    if not s.startswith("spaces/"):
+        return f"spaces/{s}"
+    return s
+
+
+def _message_text(msg: dict[str, Any]) -> str:
+    return (msg.get("text") or msg.get("argumentText") or "").strip()
+
+
+def _sender_label(msg: dict[str, Any]) -> str:
+    sender = msg.get("sender") or {}
+    if isinstance(sender, dict):
+        if sender.get("displayName"):
+            return str(sender["displayName"])
+        name = sender.get("name") or ""
+        if name:
+            return name
+    return "unknown"
+
+
+def list_spaces_formatted(*, page_size: int = 25) -> str:
+    """Human-readable list of spaces the user can see (Workspace / consumer)."""
+    service = _service()
+    page_size = max(1, min(page_size, 100))
+    resp = service.spaces().list(pageSize=page_size).execute()
+    spaces = resp.get("spaces") or []
+    if not spaces:
+        return "No spaces returned (empty list, or DMs may appear only after first message)."
+
+    lines: list[str] = []
+    for sp in spaces:
+        name = sp.get("name") or ""
+        disp = sp.get("displayName") or sp.get("spaceThreadingState") or ""
+        stype = sp.get("spaceType") or ""
+        lines.append(f"- {name}  ({disp})  type={stype}")
+    return "Spaces:\n" + "\n".join(lines)
+
+
+def list_recent_messages_formatted(space: str, *, max_messages: int = 10) -> str:
+    """Recent messages in a space (newest first per API)."""
+    service = _service()
+    parent = _normalize_space_name(space)
+    max_messages = max(1, min(max_messages, 50))
+    resp = (
+        service.spaces()
+        .messages()
+        .list(parent=parent, pageSize=max_messages)
+        .execute()
+    )
+    messages = resp.get("messages") or []
+    if not messages:
+        return f"No messages in {parent} (or no access)."
+
+    lines: list[str] = [f"Messages in {parent} (up to {max_messages}):\n"]
+    total = 0
+    cap = 14_000
+    for msg in messages:
+        who = _sender_label(msg)
+        body = _message_text(msg)
+        mid = msg.get("name") or ""
+        line = f"---\nFrom: {who}\nID: {mid}\n{body}\n"
+        if total + len(line) > cap:
+            lines.append("…(truncated)")
+            break
+        lines.append(line)
+        total += len(line)
+    return "\n".join(lines)
+
+
+def post_message_to_space(space: str, text: str) -> str:
+    """
+    Create a top-level message in a Chat space (as the OAuth user).
+    https://developers.google.com/chat/api/reference/rest/v1/spaces.messages/create
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("message text is empty")
+    if len(raw) > 4096:
+        raw = raw[:4090] + "…"
+    service = _service()
+    parent = _normalize_space_name(space)
+    try:
+        created = (
+            service.spaces()
+            .messages()
+            .create(parent=parent, body={"text": raw})
+            .execute()
+        )
+    except HttpError as e:
+        body = ""
+        try:
+            body = (e.content or b"").decode(errors="replace")[:500]
+        except Exception:
+            body = str(e)
+        code = getattr(e.resp, "status", "?") if e.resp else "?"
+        raise RuntimeError(f"Chat API HTTP {code}: {body}") from e
+    mid = created.get("name") or "?"
+    return f"Posted to {parent} — message resource: {mid}"
+
+
+def fetch_space_messages_to_markdown(
+    space: str,
+    out_path: str | Path,
+    *,
+    max_messages: int = 100,
+) -> int:
+    """Write one markdown file aggregating recent messages (for RAG ingest)."""
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    service = _service()
+    parent = _normalize_space_name(space)
+    max_messages = max(1, min(max_messages, 500))
+    resp = (
+        service.spaces()
+        .messages()
+        .list(parent=parent, pageSize=min(max_messages, 100))
+        .execute()
+    )
+    messages = resp.get("messages") or []
+    chunks: list[str] = [
+        f"# Google Chat export: {parent}\n\n",
+        f"<!-- source=google_chat_api space={parent} -->\n\n",
+    ]
+    for msg in messages:
+        who = _sender_label(msg)
+        body = _message_text(msg)
+        mid = msg.get("name") or ""
+        chunks.append(f"## {who} — {mid}\n\n{body}\n\n---\n\n")
+    text = "".join(chunks)
+    out.write_text(text, encoding="utf-8")
+    logger.info("wrote %s (%s messages)", out, len(messages))
+    return len(messages)
+```
+
+## File: `backend/app/connectors/google_chat_incoming_webhook.py`
+
+```text
+"""Google Chat incoming webhook — Slack-style POST URL (no OAuth)."""
+
+from __future__ import annotations
+
+import httpx
+
+
+def post_incoming_webhook(webhook_url: str, text: str) -> str:
+    """
+    POST {"text": "..."} to a space webhook URL from Chat UI
+    (Manage webhooks → Incoming webhook). Same idea as Slack incoming webhooks.
+    https://developers.google.com/chat/how-tos/add-incoming-webhooks
+    """
+    url = (webhook_url or "").strip()
+    if not url:
+        raise ValueError("empty webhook URL")
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("empty message")
+    if len(body) > 4096:
+        body = body[:4090] + "…"
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(url, json={"text": body})
+    if r.status_code >= 400:
+        return f"Webhook HTTP {r.status_code}: {r.text[:500]!r}"
+    return "Posted to Google Chat (incoming webhook)."
+```
+
+## File: `backend/app/connectors/gmail.py`
+
+```text
+"""Gmail API — search and export messages for RAG (readonly OAuth)."""
+
+from __future__ import annotations
+
+import base64
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPES = [GMAIL_READONLY_SCOPE]
+
+MAX_BODY_CHARS = 100_000
+
+
+def gmail_oauth_configured() -> bool:
+    return bool(
+        (settings.gmail_client_id or "").strip()
+        and (settings.gmail_client_secret or "").strip()
+        and (settings.gmail_refresh_token or "").strip()
+    )
+
+
+def build_credentials() -> Credentials:
+    if not gmail_oauth_configured():
+        raise RuntimeError(
+            "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN in .env "
+            "(see docs/GMAIL.md and python -m app.cli_gmail oauth)"
+        )
+    creds = Credentials(
+        token=None,
+        refresh_token=settings.gmail_refresh_token.strip(),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.gmail_client_id.strip(),
+        client_secret=settings.gmail_client_secret.strip(),
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def _gmail_service():
+    creds = build_credentials()
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def _decode_b64url(data: str) -> str:
+    pad = "=" * (-len(data) % 4)
+    raw = base64.urlsafe_b64decode((data + pad).encode("ascii"))
+    return raw.decode("utf-8", errors="replace")
+
+
+def _plain_text_from_payload(payload: dict[str, Any]) -> str:
+    if not payload:
+        return ""
+    body = payload.get("body") or {}
+    if body.get("data"):
+        return _decode_b64url(body["data"])
+    for part in payload.get("parts") or []:
+        mime = (part.get("mimeType") or "").lower()
+        if mime == "text/plain" and (part.get("body") or {}).get("data"):
+            return _decode_b64url(part["body"]["data"])
+    for part in payload.get("parts") or []:
+        nested = part.get("parts") or []
+        for sub in nested:
+            if (sub.get("mimeType") or "").lower() == "text/plain" and (sub.get("body") or {}).get("data"):
+                return _decode_b64url(sub["body"]["data"])
+    for part in payload.get("parts") or []:
+        if part.get("mimeType", "").lower() == "multipart/alternative":
+            return _plain_text_from_payload(part)
+    return ""
+
+
+def message_plain_text(message: dict[str, Any]) -> str:
+    payload = message.get("payload") or {}
+    text = _plain_text_from_payload(payload)
+    if text:
+        return text[:MAX_BODY_CHARS]
+    snippet = (message.get("snippet") or "").strip()
+    return snippet
+
+
+def _headers_map(payload: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for h in (payload.get("headers") or []):
+        name = (h.get("name") or "").lower()
+        val = h.get("value") or ""
+        if name:
+            out[name] = val
+    return out
+
+
+def _subject_from_message(message: dict[str, Any]) -> str:
+    payload = message.get("payload") or {}
+    hm = _headers_map(payload)
+    return hm.get("subject", "(no subject)")[:500]
+
+
+def _safe_filename(s: str) -> str:
+    s = re.sub(r"[^\w\s-]", "", s)[:80].strip() or "mail"
+    return s.replace(" ", "_")
+
+
+def fetch_query_to_markdown(
+    query: str,
+    out_dir: Path,
+    *,
+    max_messages: int = 50,
+) -> list[Path]:
+    """
+    Run Gmail search (`q` same as Gmail UI), write one .md per message.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    service = _gmail_service()
+    user_id = "me"
+    lst = (
+        service.users()
+        .messages()
+        .list(userId=user_id, q=query, maxResults=max_messages)
+        .execute()
+    )
+    msgs = lst.get("messages") or []
+    written: list[Path] = []
+    for m in msgs:
+        mid = m.get("id")
+        if not mid:
+            continue
+        full = (
+            service.users()
+            .messages()
+            .get(userId=user_id, id=mid, format="full")
+            .execute()
+        )
+        subj = _subject_from_message(full)
+        body = message_plain_text(full)
+        header = (
+            f"# {subj}\n\n"
+            f"<!-- gmail_id={mid} query={query!r} -->\n\n"
+        )
+        fname = f"{mid}_{_safe_filename(subj)}.md"
+        path = out_dir / fname
+        path.write_text(header + body, encoding="utf-8")
+        written.append(path)
+        logger.info("wrote %s", path.name)
+    return written
+
+
+def search_messages_formatted(query: str, *, max_results: int = 5) -> str:
+    """
+    Short text for the agent tool: subjects + snippet + truncated body preview.
+    """
+    service = _gmail_service()
+    user_id = "me"
+    max_results = max(1, min(max_results, 20))
+    lst = (
+        service.users()
+        .messages()
+        .list(userId=user_id, q=query, maxResults=max_results)
+        .execute()
+    )
+    msgs = lst.get("messages") or []
+    if not msgs:
+        return f"No messages matched query: {query!r}"
+
+    lines: list[str] = []
+    total_chars = 0
+    cap = 12_000
+
+    for m in msgs:
+        mid = m.get("id")
+        if not mid:
+            continue
+        full = (
+            service.users()
+            .messages()
+            .get(userId=user_id, id=mid, format="full")
+            .execute()
+        )
+        subj = _subject_from_message(full)
+        body = message_plain_text(full).strip()
+        preview = body[:2000] if len(body) > 2000 else body
+        block = f"---\nSubject: {subj}\nID: {mid}\n\n{preview}\n"
+        if total_chars + len(block) > cap:
+            lines.append("…(truncated: more results omitted for size)")
+            break
+        lines.append(block)
+        total_chars += len(block)
+
+    return "\n".join(lines)
+```
+
+## File: `backend/app/static/index.html`
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local AI Assistant</title>
+  <style>
+    :root {
+      --bg: #1b1b2f;
+      --accent: #00c9a7;
+      --text: #e8e8f0;
+      --muted: #889;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      padding: 1.5rem;
+      max-width: 42rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.25rem; }
+    p.sub { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.25rem; }
+    a { color: var(--accent); }
+    label { display: block; font-size: 0.85rem; margin-bottom: 0.35rem; color: var(--muted); }
+    textarea {
+      width: 100%;
+      min-height: 6rem;
+      padding: 0.75rem;
+      border: 1px solid #334;
+      border-radius: 8px;
+      background: #252538;
+      color: var(--text);
+      font-size: 1rem;
+      resize: vertical;
+    }
+    .row { margin-bottom: 1rem; }
+    .tools { display: flex; align-items: center; gap: 0.5rem; }
+    input[type="checkbox"] { accent-color: var(--accent); }
+    button {
+      background: var(--accent);
+      color: #1b1b2f;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:hover:not(:disabled) { filter: brightness(1.05); }
+    .out {
+      margin-top: 1.25rem;
+      padding: 1rem;
+      background: #252538;
+      border-radius: 8px;
+      border-left: 3px solid var(--accent);
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 3rem;
+      font-size: 0.95rem;
+    }
+    .err { color: #f88; border-left-color: #f66; }
+    .links { margin-top: 1rem; font-size: 0.85rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <h1>Local AI Assistant</h1>
+  <p class="sub">Calls <code>POST /v1/chat</code> on this server (same origin).</p>
+
+  <div class="row">
+    <label for="msg">Message</label>
+    <textarea id="msg" placeholder="Ask about your ingested docs…"></textarea>
+  </div>
+  <div class="row tools">
+    <input type="checkbox" id="tools" />
+    <label for="tools" style="margin:0;">Use tools (Jira, Bitbucket, RAG search, …)</label>
+  </div>
+  <button type="button" id="send">Send</button>
+
+  <div id="out" class="out" aria-live="polite">Response will appear here.</div>
+
+  <div class="links">
+    <a href="/ui/integrations.html">Integrations demo</a> ·
+    <a href="/docs">OpenAPI (Swagger)</a> ·
+    <a href="/health">/health</a> ·
+    <a href="/">JSON root</a>
+  </div>
+
+  <script>
+    const out = document.getElementById("out");
+    const send = document.getElementById("send");
+    document.getElementById("send").addEventListener("click", async () => {
+      const message = document.getElementById("msg").value.trim();
+      if (!message) {
+        out.textContent = "Enter a message.";
+        out.classList.add("err");
+        return;
+      }
+      send.disabled = true;
+      out.classList.remove("err");
+      out.textContent = "…";
+      try {
+        const r = await fetch("/v1/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message,
+            use_tools: document.getElementById("tools").checked,
+          }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          out.classList.add("err");
+          out.textContent = JSON.stringify(data, null, 2);
+          return;
+        }
+        out.textContent = data.answer ?? JSON.stringify(data);
+      } catch (e) {
+        out.classList.add("err");
+        out.textContent = String(e);
+      } finally {
+        send.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+```
+
+## File: `backend/app/static/integrations.html`
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Integrations demo — Local AI Assistant</title>
+  <style>
+    :root { --bg: #1b1b2f; --accent: #00c9a7; --text: #e8e8f0; --muted: #889; --ok: #6c6; --off: #c66; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, Segoe UI, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 1rem 1.25rem 3rem; max-width: 52rem; margin-left: auto; margin-right: auto; }
+    h1 { font-size: 1.35rem; margin: 0 0 0.5rem; }
+    h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; color: var(--accent); border-bottom: 1px solid #334; padding-bottom: 0.35rem; }
+    p, li { color: var(--muted); font-size: 0.92rem; line-height: 1.45; }
+    a { color: var(--accent); }
+    .pill { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 6px; font-size: 0.75rem; margin-right: 0.35rem; margin-bottom: 0.35rem; }
+    .on { background: #1a3d2a; color: #8f8; }
+    .off { background: #3d1a1a; color: #f88; }
+    pre, .out { background: #252538; border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.82rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; border-left: 3px solid var(--accent); }
+    .err { border-left-color: var(--off); color: #faa; }
+    .thread { max-height: min(70vh, 520px); overflow-y: auto; background: #16162a; border-radius: 10px; padding: 0.75rem; margin-top: 0.75rem; border: 1px solid #2a2a40; }
+    .bubble { margin-bottom: 0.85rem; }
+    .bubble .who { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 0.25rem; }
+    .bubble .text { background: #252538; padding: 0.65rem 0.85rem; border-radius: 8px; white-space: pre-wrap; word-break: break-word; font-size: 0.88rem; line-height: 1.45; }
+    .bubble.user .text { border-left: 3px solid #6af; }
+    .bubble.assistant .text { border-left: 3px solid var(--accent); }
+    .trace { margin-top: 0.5rem; font-size: 0.78rem; color: #aab; }
+    .cards { margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.45rem; }
+    .card { background: #1e1e32; border: 1px solid #363650; border-radius: 8px; padding: 0.5rem 0.65rem; }
+    .card h4 { margin: 0 0 0.35rem; font-size: 0.72rem; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.04em; }
+    .card pre { margin: 0; font-size: 0.75rem; white-space: pre-wrap; word-break: break-word; background: transparent; border: none; padding: 0; }
+    .card.jira { border-color: #2a5a8a; }
+    .card.bb { border-color: #2a6a5a; }
+    .card.rag { border-color: #6a4a8a; }
+    .card.gchat { border-color: #8a6a2a; }
+    textarea, .inp { width: 100%; padding: 0.6rem; border: 1px solid #334; border-radius: 8px; background: #252538; color: var(--text); font-size: 0.9rem; }
+    textarea { min-height: 4rem; }
+    button { background: var(--accent); color: #1b1b2f; border: none; padding: 0.45rem 0.9rem; font-weight: 600; border-radius: 8px; cursor: pointer; margin: 0.25rem 0.35rem 0.25rem 0; font-size: 0.88rem; }
+    button.secondary { background: #3a3a55; color: var(--text); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .row { margin: 0.5rem 0; }
+    code { background: #2a2a40; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Integrations demo</h1>
+  <p>Confluence (ingest → RAG) · Jira · Bitbucket · Google Chat — same backend as <a href="/docs">/docs</a>. LLM: Ollama or OpenAI.</p>
+  <p><a href="/ui/">← Simple chat</a></p>
+
+  <h2>1) Status (from your env — no secrets)</h2>
+  <div id="pills"></div>
+  <pre id="status">Loading…</pre>
+
+  <h2>2) Create Jira ticket</h2>
+  <p class="row" style="margin-top:0"><strong>Recommended:</strong> describe what you need; the assistant calls <code>POST /v1/chat</code> with <code>use_tools: true</code> so the <strong>LLM</strong> picks <code>jira_create_issue</code> arguments. Results appear in the <a href="#chatThread">live chat thread</a> below (answer + tool card).</p>
+  <div class="row"><label for="jiraIntent">What ticket do you need?</label><br /><textarea id="jiraIntent" placeholder="e.g. Bug: login fails on Safari — steps: open /login, …"></textarea></div>
+  <button type="button" id="jiraCreateLLM">Create with LLM + tools</button>
+  <p class="row" style="font-size:0.85rem;margin-top:1rem"><strong>Direct API (no LLM):</strong> fixed summary / description — <code>POST /v1/demo/jira-issue</code> (same Jira call as the tool; use if your local model skips tools).</p>
+  <div class="row"><label for="jiraSummary">Summary</label><br /><input type="text" id="jiraSummary" class="inp" placeholder="Short title" maxlength="500" /></div>
+  <div class="row"><label for="jiraDesc">Description</label><br /><textarea id="jiraDesc" placeholder="Details (optional)"></textarea></div>
+  <div class="row"><label for="jiraType">Issue type</label><br /><input type="text" id="jiraType" class="inp" placeholder="Task" style="max-width:12rem" /></div>
+  <button type="button" class="secondary" id="jiraCreate">Create ticket (direct)</button>
+  <pre id="jiraOut" class="out" style="margin-top:0.75rem">Direct API result —</pre>
+
+  <h2>3) Live chat — RAG + tools (shows sources &amp; tool results)</h2>
+  <p class="row" style="margin-top:0">Turn off <strong>use_tools</strong> to see <em>indexed knowledge</em> excerpts (Confluence export / markdown). Turn it on to see <em>Jira / Bitbucket / Google Chat / search_internal_knowledge</em> steps.</p>
+  <div class="row"><textarea id="msg" placeholder="Ask about indexed docs…">What stack does the sample knowledge describe?</textarea></div>
+  <div class="row"><label><input type="checkbox" id="tools" /> use_tools — agent calls Jira, Bitbucket, search_internal_knowledge, …</label></div>
+  <button type="button" id="send">Send</button>
+  <button type="button" class="secondary" id="clearThread">Clear thread</button>
+  <div id="chatThread" class="thread" aria-live="polite"></div>
+  <p class="row" style="font-size:0.85rem">Enable <strong>use_tools</strong> and ask in your own words (e.g. post “Hello” to Google Chat, list Bitbucket repos, create a Jira task). If something shows <code>[Stub]</code>, set <code>JIRA_*</code> / <code>BITBUCKET_*</code> / <code>GOOGLE_CHAT_API_*</code> in <code>.env</code> — <code>docs/INTEGRATIONS.md</code>.</p>
+
+  <h2>4) Confluence → RAG</h2>
+  <p>Pulls a space into <code>data/knowledge/</code> then re-ingest. Requires <code>CONFLUENCE_*</code> in <code>.env</code>.</p>
+  <pre>cd backend && python -m app.cli_confluence --space YOUR_SPACE_KEY --ingest</pre>
+  <p>After ingest, ask in the chat above about that content.</p>
+
+  <h2>5) Google Chat — post to a space</h2>
+  <p class="row" style="margin-top:0"><strong>Slack-style (no OAuth):</strong> in Chat open the space → <strong>Manage webhooks</strong> → <strong>Incoming webhook</strong> → copy the URL into <code>GOOGLE_CHAT_INCOMING_WEBHOOK_URL</code> in <code>.env</code> and restart — then only the message below matters (space field ignored). <strong>Or OAuth:</strong> <code>GOOGLE_CHAT_API_*</code> + <code>python -m app.cli_google_chat_api oauth</code>; set <code>GOOGLE_CHAT_API_DEFAULT_SPACE</code> or fill Space. See <code>docs/GOOGLE_CHAT.md</code>.</p>
+  <div class="row"><label for="gchatSpace">Space (optional if default in .env)</label><br /><input type="text" id="gchatSpace" class="inp" placeholder="spaces/AAAA…" /></div>
+  <div class="row"><label for="gchatMsg">Message</label><br /><textarea id="gchatMsg" placeholder="Hello from Local AI Assistant"></textarea></div>
+  <button type="button" id="gchatSendOAuth">Post to Google Chat</button>
+  <pre id="gchatSendOut" class="out" style="margin-top:0.75rem">—</pre>
+
+  <h2>6) Google Chat (webhook bot)</h2>
+  <p>Google calls <code>POST /v1/integrations/google-chat</code> when someone messages <strong>your Chat app</strong>. Set <code>GOOGLE_CHAT_ENABLED=true</code> in <code>.env</code>.</p>
+  <button type="button" id="gchatSample">POST sample MESSAGE (same as Google)</button>
+  <div id="gchatOut" class="out" style="margin-top:0.75rem">…</div>
+  <p style="font-size:0.8rem;">If you use <code>GOOGLE_CHAT_SHARED_SECRET</code>, paste it below for this test:</p>
+  <input type="password" id="chatSecret" placeholder="X-Chat-Secret (optional)" style="width:100%;max-width:24rem;padding:0.4rem;border-radius:6px;border:1px solid #334;background:#252538;color:var(--text);" />
+
+  <script>
+    const out = (id, text, isErr) => {
+      const el = document.getElementById(id);
+      el.textContent = text;
+      el.classList.toggle("err", !!isErr);
+    };
+
+    async function loadStatus() {
+      try {
+        const r = await fetch("/v1/demo/integration-status");
+        const j = await r.json();
+        document.getElementById("status").textContent = JSON.stringify(j, null, 2);
+        const pills = document.getElementById("pills");
+        pills.innerHTML = "";
+        const mk = (k, v) => {
+          const s = document.createElement("span");
+          s.className = "pill " + (v ? "on" : "off");
+          s.textContent = k + ": " + (v ? "on" : "off");
+          pills.appendChild(s);
+        };
+        mk("LLM", j.llm !== "none");
+        if (j.atlassian_tls) {
+          const tlsOk = j.atlassian_tls === "verify" || j.atlassian_tls === "ca_bundle";
+          const s = document.createElement("span");
+          s.className = "pill " + (tlsOk ? "on" : "off");
+          s.title = "Jira/Bitbucket/Confluence API HTTPS: verify=strict, ca_bundle=corp CA, insecure=no verify (dev only)";
+          s.textContent = "TLS: " + j.atlassian_tls;
+          pills.appendChild(s);
+        }
+        mk("Jira", j.jira);
+        mk("Bitbucket", j.bitbucket);
+        mk("Confluence", j.confluence);
+        mk("Chat webhook", j.google_chat_webhook);
+        if (j.google_chat_incoming_webhook !== undefined) {
+          mk("Chat post URL", j.google_chat_incoming_webhook);
+        }
+        mk("Chat API OAuth", j.google_chat_api);
+      } catch (e) {
+        out("status", String(e), true);
+      }
+    }
+
+    function esc(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function toolCardClass(name) {
+      if (name === "jira_create_issue") return "jira";
+      if (name === "bitbucket_list_repositories") return "bb";
+      if (name === "search_internal_knowledge") return "rag";
+      if (name === "google_chat_send_message" || name === "google_chat_list_spaces" || name === "google_chat_recent_messages") return "gchat";
+      return "";
+    }
+
+    function toolTitle(name) {
+      const m = {
+        jira_create_issue: "Jira",
+        bitbucket_list_repositories: "Bitbucket",
+        search_internal_knowledge: "Indexed knowledge (RAG search)",
+        google_chat_send_message: "Google Chat (post)",
+        google_chat_list_spaces: "Google Chat (spaces)",
+        google_chat_recent_messages: "Google Chat (read)",
+      };
+      return m[name] || name;
+    }
+
+    function appendBubble(role, html) {
+      const thread = document.getElementById("chatThread");
+      const wrap = document.createElement("div");
+      wrap.className = "bubble " + role;
+      wrap.innerHTML = html;
+      thread.appendChild(wrap);
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    /**
+     * @param {string} message — sent to the API (may include system-style instructions)
+     * @param {boolean} useTools
+     * @param {string} [displayMessage] — if set, shown in the user bubble instead of `message`
+     */
+    async function postChat(message, useTools, displayMessage) {
+      const shown = displayMessage !== undefined && displayMessage !== null ? displayMessage : message;
+      const who = useTools ? "(tools on)" : "(RAG only)";
+      appendBubble("user", `<div class="who">You ${who}</div><div class="text">${esc(shown)}</div>`);
+      const loading = document.createElement("div");
+      loading.className = "bubble assistant";
+      loading.innerHTML = `<div class="who">Assistant</div><div class="text">…</div>`;
+      document.getElementById("chatThread").appendChild(loading);
+
+      const r = await fetch("/v1/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, use_tools: useTools }),
+      });
+      let data;
+      try {
+        data = await r.json();
+      } catch (e) {
+        loading.querySelector(".text").textContent = String(e);
+        return;
+      }
+      loading.remove();
+
+      if (!r.ok) {
+        appendBubble("assistant", `<div class="who">Error</div><div class="text err">${esc(JSON.stringify(data, null, 2))}</div>`);
+        return;
+      }
+
+      const answer = data.answer || "";
+      let body = `<div class="who">Assistant</div><div class="text">${esc(answer)}</div>`;
+      if (data.trace_mode) {
+        body += `<div class="trace">trace_mode: <code>${esc(data.trace_mode)}</code></div>`;
+      }
+
+      if (data.sources && data.sources.length) {
+        body += `<div class="cards">`;
+        body += `<div class="card rag"><h4>Indexed passages (Confluence export / knowledge)</h4>`;
+        for (const s of data.sources) {
+          const dist = s.distance != null ? ` · distance ${esc(String(s.distance))}` : "";
+          body += `<p style="margin:0.35rem 0 0.15rem;font-size:0.72rem;color:#aab"><strong>${esc(s.source || "?")}</strong>${dist}</p>`;
+          body += `<pre>${esc(s.excerpt || "")}</pre>`;
+        }
+        body += `</div></div>`;
+      }
+
+      if (data.tool_steps && data.tool_steps.length) {
+        body += `<div class="cards">`;
+        for (const step of data.tool_steps) {
+          const cls = toolCardClass(step.tool);
+          const title = toolTitle(step.tool);
+          body += `<div class="card ${cls}"><h4>${esc(title)}</h4>`;
+          body += `<p style="margin:0 0 0.35rem;font-size:0.72rem;color:#aab">tool: <code>${esc(step.tool)}</code></p>`;
+          if (step.arguments && Object.keys(step.arguments).length) {
+            body += `<pre style="opacity:0.95">${esc(JSON.stringify(step.arguments, null, 2))}</pre>`;
+          }
+          body += `<pre style="margin-top:0.4rem;border-top:1px solid #363650;padding-top:0.4rem">${esc(step.result || "")}</pre>`;
+          body += `</div>`;
+        }
+        body += `</div>`;
+      }
+
+      appendBubble("assistant", body);
+    }
+
+    document.getElementById("send").onclick = () => {
+      const msg = document.getElementById("msg").value.trim();
+      if (!msg) return;
+      postChat(msg, document.getElementById("tools").checked);
+    };
+
+    document.getElementById("clearThread").onclick = () => {
+      document.getElementById("chatThread").innerHTML = "";
+    };
+
+    document.getElementById("gchatSendOAuth").onclick = async () => {
+      const message = document.getElementById("gchatMsg").value.trim();
+      if (!message) {
+        out("gchatSendOut", "Message is required.", true);
+        return;
+      }
+      out("gchatSendOut", "…", false);
+      const r = await fetch("/v1/demo/google-chat-send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          space: document.getElementById("gchatSpace").value.trim(),
+          message,
+        }),
+      });
+      let j;
+      try {
+        j = await r.json();
+      } catch (e) {
+        out("gchatSendOut", String(e), true);
+        return;
+      }
+      const text = j.result != null ? String(j.result) : JSON.stringify(j, null, 2);
+      out("gchatSendOut", text, r.status >= 400);
+    };
+
+    document.getElementById("gchatSample").onclick = async () => {
+      out("gchatOut", "…", false);
+      const headers = { "Content-Type": "application/json" };
+      const sec = document.getElementById("chatSecret").value.trim();
+      if (sec) headers["X-Chat-Secret"] = sec;
+      const body = {
+        type: "MESSAGE",
+        message: { text: "What is the Local AI Assistant project?" },
+        space: { name: "spaces/demo" },
+      };
+      const r = await fetch("/v1/integrations/google-chat", { method: "POST", headers, body: JSON.stringify(body) });
+      let j;
+      try { j = await r.json(); } catch { j = { raw: await r.text() }; }
+      out("gchatOut", (typeof j === "object" && j.text !== undefined) ? j.text : JSON.stringify(j, null, 2), r.status >= 400);
+    };
+
+    document.getElementById("jiraCreateLLM").onclick = async () => {
+      const userText = document.getElementById("jiraIntent").value.trim();
+      if (!userText) {
+        out("jiraOut", "Describe the ticket first (or use Direct API below).", true);
+        return;
+      }
+      const internal =
+        "Create a Jira issue using the jira_create_issue tool. Infer summary, description, and issue type from the user request. " +
+        "If issue type is unclear, use Task. Call the tool once.\n\nUser request:\n" +
+        userText;
+      await postChat(internal, true, userText);
+    };
+
+    document.getElementById("jiraCreate").onclick = async () => {
+      const summary = document.getElementById("jiraSummary").value.trim();
+      if (!summary) {
+        out("jiraOut", "Summary is required.", true);
+        return;
+      }
+      out("jiraOut", "…", false);
+      const r = await fetch("/v1/demo/jira-issue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          summary,
+          description: document.getElementById("jiraDesc").value,
+          issue_type: document.getElementById("jiraType").value.trim() || "Task",
+        }),
+      });
+      let j;
+      try {
+        j = await r.json();
+      } catch (e) {
+        out("jiraOut", String(e), true);
+        return;
+      }
+      const text = j.result != null ? String(j.result) : JSON.stringify(j, null, 2);
+      out("jiraOut", text, r.status >= 400);
+    };
+
+    loadStatus();
+  </script>
+</body>
+</html>
+```
+
+## File: `backend/tests/__init__.py`
+
+```text
+
+```
+
+## File: `backend/tests/test_adaptive.py`
+
+```text
+from app.services.query_router import should_retrieve
+
+
+def test_should_skip_short_greeting():
+    assert should_retrieve("Hi") is False
+    assert should_retrieve("Hello!") is False
+    assert should_retrieve("Thanks") is False
+
+
+def test_should_retrieve_real_question():
+    assert should_retrieve("What is the CQA deployment process for production?") is True
+    assert should_retrieve("How do I configure WAF for HSL?") is True
+```
+
+## File: `backend/tests/test_chat_trace.py`
+
+```text
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_chat_response_has_trace_fields():
+    c = TestClient(app)
+    r = c.post("/v1/chat", json={"message": "hello", "use_tools": False})
+    assert r.status_code == 200
+    data = r.json()
+    assert "answer" in data
+    assert "sources" in data and isinstance(data["sources"], list)
+    assert "tool_steps" in data and isinstance(data["tool_steps"], list)
+    assert "trace_mode" in data
+
+
+@patch(
+    "app.routers.chat.answer_with_tools_with_trace",
+    return_value=(
+        "Ticket flow complete.",
+        [
+            {
+                "tool": "jira_create_issue",
+                "arguments": {"summary": "Demo", "description": "test"},
+                "result": "[Stub] Jira not configured.",
+            }
+        ],
+    ),
+)
+def test_chat_tools_returns_agent_trace(_mock):
+    c = TestClient(app)
+    r = c.post("/v1/chat", json={"message": "Create a Jira task.", "use_tools": True})
+    assert r.status_code == 200
+    data = r.json()
+    assert data.get("trace_mode") == "agent"
+    assert len(data.get("tool_steps") or []) == 1
+    assert data["tool_steps"][0]["tool"] == "jira_create_issue"
+```
+
+## File: `backend/tests/test_demo_status.py`
+
+```text
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_integration_status_ok():
+    c = TestClient(app)
+    r = c.get("/v1/demo/integration-status")
+    assert r.status_code == 200
+    data = r.json()
+    assert "llm" in data
+    assert "jira" in data
+    assert "bitbucket" in data
+    assert "confluence" in data
+    assert "google_chat_webhook" in data
+    assert "google_chat_incoming_webhook" in data
+    assert data.get("atlassian_tls") in ("verify", "insecure", "ca_bundle")
+
+
+def test_jira_issue_endpoint_calls_tool(monkeypatch):
+    calls = []
+
+    def fake_execute(name, args):
+        calls.append((name, args))
+        assert name == "jira_create_issue"
+        return "[Stub] would create"
+
+    monkeypatch.setattr("app.routers.demo_integration.execute_tool", fake_execute)
+    c = TestClient(app)
+    r = c.post(
+        "/v1/demo/jira-issue",
+        json={"summary": "Test ticket", "description": "Body", "issue_type": "Bug"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"result": "[Stub] would create"}
+    assert calls[0][1]["summary"] == "Test ticket"
+    assert calls[0][1]["description"] == "Body"
+    assert calls[0][1]["issue_type"] == "Bug"
+
+
+def test_jira_issue_empty_summary_422():
+    c = TestClient(app)
+    r = c.post("/v1/demo/jira-issue", json={"summary": ""})
+    assert r.status_code == 422
+
+
+def test_google_chat_send_calls_tool(monkeypatch):
+    calls = []
+
+    def fake_execute(name, args):
+        calls.append((name, args))
+        return "[Stub] would post"
+
+    monkeypatch.setattr("app.routers.demo_integration.execute_tool", fake_execute)
+    c = TestClient(app)
+    r = c.post("/v1/demo/google-chat-send", json={"space": "spaces/x", "message": "Hi"})
+    assert r.status_code == 200
+    assert r.json() == {"result": "[Stub] would post"}
+    assert calls[0][0] == "google_chat_send_message"
+    assert calls[0][1]["message"] == "Hi"
+
+
+def test_google_chat_send_empty_message_422():
+    c = TestClient(app)
+    r = c.post("/v1/demo/google-chat-send", json={"space": "", "message": ""})
+    assert r.status_code == 422
+```
+
+## File: `backend/tests/test_gmail_tool.py`
+
+```text
+from app.tools.handlers import execute_tool
+
+
+def test_gmail_stub_without_env():
+    out = execute_tool("gmail_search", {"query": "newer_than:1d", "max_results": 3})
+    assert "[Stub]" in out or "not configured" in out.lower()
+```
+
+## File: `backend/tests/test_google_chat_api_tool.py`
+
+```text
+from app.tools.handlers import execute_tool
+
+
+def test_google_chat_list_spaces_stub():
+    out = execute_tool("google_chat_list_spaces", {"page_size": 10})
+    assert "[Stub]" in out or "not configured" in out.lower()
+
+
+def test_google_chat_recent_messages_stub_no_default_space():
+    out = execute_tool("google_chat_recent_messages", {})
+    assert "[Stub]" in out or "Missing space" in out or "not configured" in out.lower()
+```
+
+## File: `backend/tests/test_google_chat_handler.py`
+
+```text
+from unittest.mock import patch
+
+from app.services.google_chat_handler import handle_google_chat_event
+
+
+def test_added_to_space():
+    out = handle_google_chat_event({"type": "ADDED_TO_SPACE"})
+    assert "text" in out
+    assert "connected" in out["text"].lower()
+
+
+def test_message_help():
+    out = handle_google_chat_event(
+        {
+            "type": "MESSAGE",
+            "message": {"text": "help"},
+            "space": {"name": "spaces/test"},
+        }
+    )
+    assert "help" in out["text"].lower() or "commands" in out["text"].lower()
+
+
+@patch("app.services.google_chat_handler.answer_query", return_value="mocked answer")
+def test_message_with_mention_stripped(_mock_answer):
+    out = handle_google_chat_event(
+        {
+            "type": "MESSAGE",
+            "message": {"text": "<users/123> What is 2+2?"},
+            "space": {"name": "spaces/test"},
+        }
+    )
+    assert out["text"] == "mocked answer"
+```
+
+## File: `backend/tests/test_health.py`
+
+```text
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+```
+
+## File: `backend/tests/test_tools.py`
+
+```text
+from app.config import settings
+from app.tools.handlers import execute_tool
+
+
+def test_jira_stub_without_env(monkeypatch):
+    monkeypatch.setattr(settings, "jira_base_url", "")
+    monkeypatch.setattr(settings, "jira_email", "")
+    monkeypatch.setattr(settings, "jira_api_token", "")
+    monkeypatch.setattr(settings, "jira_default_project_key", "")
+    out = execute_tool(
+        "jira_create_issue",
+        {"summary": "Test", "description": "Desc", "issue_type": "Task"},
+    )
+    assert "[Stub]" in out or "Jira not configured" in out
+
+
+def test_bitbucket_stub_without_env(monkeypatch):
+    monkeypatch.setattr(settings, "bitbucket_workspace", "")
+    monkeypatch.setattr(settings, "bitbucket_username", "")
+    monkeypatch.setattr(settings, "bitbucket_app_password", "")
+    out = execute_tool("bitbucket_list_repositories", {})
+    assert "[Stub]" in out or "not configured" in out.lower()
+
+
+def test_google_chat_send_stub_without_oauth(monkeypatch):
+    monkeypatch.setattr(settings, "google_chat_api_client_id", "")
+    monkeypatch.setattr(settings, "google_chat_api_client_secret", "")
+    monkeypatch.setattr(settings, "google_chat_api_refresh_token", "")
+    monkeypatch.setattr(settings, "google_chat_incoming_webhook_url", "")
+    out = execute_tool("google_chat_send_message", {"space": "spaces/x", "message": "Hi"})
+    assert "[Stub]" in out or "not configured" in out.lower()
+
+
+def test_google_chat_send_via_incoming_webhook(monkeypatch):
+    monkeypatch.setattr(settings, "google_chat_incoming_webhook_url", "https://example.com/hook")
+    monkeypatch.setattr(settings, "google_chat_api_client_id", "")
+    monkeypatch.setattr(settings, "google_chat_api_client_secret", "")
+    monkeypatch.setattr(settings, "google_chat_api_refresh_token", "")
+
+    def fake_post(url: str, text: str) -> str:
+        assert url == "https://example.com/hook"
+        assert text == "Hello"
+        return "Posted to Google Chat (incoming webhook)."
+
+    monkeypatch.setattr("app.tools.handlers.post_incoming_webhook", fake_post)
+    out = execute_tool("google_chat_send_message", {"space": "", "message": "Hello"})
+    assert "Posted" in out
+```
+
